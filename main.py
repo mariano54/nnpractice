@@ -63,7 +63,12 @@ def calc_cross_entropy_loss(
     predicted: NDArray[float32], target: NDArray[float32]
 ) -> float32:
     assert len(predicted) == len(target)
-    return np.sum([target[i] * np.log(predicted[i]) for i in range(predicted)])
+    return np.sum(
+        [
+            target[i] * (np.log(predicted[i]) if predicted[i] != 0 else 0)
+            for i in range(len(predicted))
+        ]
+    )
 
 
 def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsNew:
@@ -76,12 +81,6 @@ def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsNew:
         all_layers.append(Layer(weights, biases))
         activation_size = layer_size
     return NNWeightsNew(all_layers)
-
-
-def gradient_descent(dataset: NDArray[NDArray[float32]]):
-    for i in range(0, len(dataset), 1000):
-        # iterate 1000 at a time
-        pass
 
 
 def load_data() -> Tuple[List[NDArray[float32]], List[int]]:
@@ -117,16 +116,87 @@ def load_data() -> Tuple[List[NDArray[float32]], List[int]]:
 
 
 def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
+    all_bias_deltas = []
     processed = 0
+    for layer in reversed(network.layers):
+        num_biases = len(layer.biases)
+        bias_deltas = np.array(deltas[-(processed + num_biases + 1) : -(processed + 1)])
+        all_bias_deltas.append(bias_deltas)
+        processed += num_biases
+    all_bias_deltas = list(reversed(all_bias_deltas))
+
+    processed_w = 0
     for layer_i, layer in enumerate(network.layers):
         to_process = layer.weights.size
-        flat_weights = np.array(
-            deltas[processed : (processed + to_process)], dtype=float32
+        flat_weight_deltas = np.array(
+            deltas[processed_w : (processed_w + to_process)], dtype=float32
         )
-        weights = flat_weights.reshape(layer.weights.shape)
-        bias_index = len(network.layers) - layer_i
-        bias = deltas[-bias_index]
-        network.layers[layer_i] = Layer(weights=weights, biases=bias)
+        weight_deltas = flat_weight_deltas.reshape(layer.weights.shape)
+        new_biases = layer.biases + all_bias_deltas[layer_i]
+        new_weights = layer.weights + weight_deltas
+        network.layers[layer_i] = Layer(weights=new_weights, biases=new_biases)
+        processed_w += to_process
+    assert processed + processed_w == 16485
+
+
+def process_sample(
+    sample: NDArray[float32], label: int, network: NNWeightsNew
+) -> Tuple[float32, NDArray[float32]]:
+    activations = compute_nn(sample, network)
+    assert len(activations) == 4  # layers
+    outputs = activations[-1]
+    assert len(outputs) == 10
+    y = np.zeros(len(outputs), dtype=float32)
+    y[label] = 1.0
+
+    loss = calc_cross_entropy_loss(outputs, y)
+
+    all_W_deltas = []
+    all_bias_deltas = []
+    deltas = np.array([outputs[d] - y[d] for d in range(len(outputs))])
+
+    flattenned_ordered_deltas: NDArray[float32] = np.array([], dtype=float32)
+
+    for layer_index in [2, 1, 0]:
+        activation_index = layer_index + 1  # Activation also includes Xs in there
+        W_deltas: NDArray[float32] = np.zeros(
+            shape=(
+                len(activations[activation_index]),
+                len(activations[activation_index - 1]),
+            ),
+            dtype=float32,
+        )
+        bias_deltas = np.zeros(
+            shape=(len(activations[activation_index])),
+        )
+        new_deltas = np.zeros(
+            shape=(len(activations[activation_index])),
+        )
+        for k in range(len(activations[activation_index])):
+            if activation_index != 3:
+                delta = deltas.dot(network.layers[layer_index + 1].weights[:, k]) * (
+                    1 if activations[activation_index][k] > 0 else 0
+                )
+            else:
+                delta = deltas[k]
+            new_deltas[k] = delta
+            for j in range(len(activations[activation_index - 1])):
+                W_deltas[k, j] = delta * activations[activation_index - 1][j]
+            bias_deltas[k] = delta
+        all_W_deltas.append(W_deltas)
+        all_bias_deltas.append(bias_deltas)
+        deltas = new_deltas
+
+    for W_delta_matrix in reversed(all_W_deltas):
+        flattenned_ordered_deltas = numpy.concatenate(
+            [flattenned_ordered_deltas, W_delta_matrix.flatten()]
+        )
+    for bias_d_vector in reversed(all_bias_deltas):
+        flattenned_ordered_deltas = numpy.concatenate(
+            [flattenned_ordered_deltas, bias_d_vector]
+        )
+
+    return (loss, flattenned_ordered_deltas)
 
 
 def train_model(
@@ -146,67 +216,31 @@ def train_model(
     cumulative_flattened_deltas: NDArray[float32] = np.zeros(
         parameter_size, dtype=float32
     )
+    batch_loss = 0.0
+    step_size = 0.001
+    for batch in range(1, 50):
+        for batch_index in range(batch_size):
+            print(f"Processed image {batch_index}")
+            loss, flattenned_ordered_deltas = process_sample(
+                images[batch_index], labels[batch_index], initial_w
+            )
+            batch_loss += loss
+            print("Loss:", loss)
+            cumulative_flattened_deltas += flattenned_ordered_deltas
+
+    print("batch loss", batch_loss)
+    apply_gradient(initial_w, step_size * -1 * cumulative_flattened_deltas)
+
+    new_batch_loss = 0.0
     for batch_index in range(batch_size):
         print(f"Processed image {batch_index}")
-        activations = compute_nn(images[batch_index], initial_w)
-        assert len(activations) == 4  # layers
-        outputs = activations[-1]
-        assert len(outputs) == 10
-        y = np.zeros(len(outputs), dtype=float32)
-
-        y[labels[batch_index]] = 1.0
-
-        all_results.append(outputs)
-        all_W_deltas = []
-        all_bias_deltas = []
-        deltas = np.array([outputs[d] - y[d] for d in range(len(outputs))])
-
-        flattenned_ordered_deltas: NDArray[float32] = np.array([], dtype=float32)
-
-        for layer_index in [2, 1, 0]:
-            activation_index = layer_index + 1  # Activation also includes Xs in there
-            W_deltas: NDArray[float32] = np.zeros(
-                shape=(
-                    len(activations[activation_index]),
-                    len(activations[activation_index - 1]),
-                ),
-                dtype=float32,
-            )
-            bias_deltas = np.zeros(
-                shape=(len(activations[activation_index])),
-            )
-            new_deltas = np.zeros(
-                shape=(len(activations[activation_index])),
-            )
-            for k in range(len(activations[activation_index])):
-                if activation_index != 3:
-                    delta = deltas.dot(
-                        initial_w.layers[layer_index + 1].weights[:, k]
-                    ) * (1 if activations[activation_index][k] > 0 else 0)
-                else:
-                    delta = deltas[k]
-                new_deltas[k] = delta
-                for j in range(len(activations[activation_index - 1])):
-                    W_deltas[k, j] = delta * activations[activation_index - 1][j]
-                bias_deltas[k] = delta
-            all_W_deltas.append(W_deltas)
-            all_bias_deltas.append(bias_deltas)
-            deltas = new_deltas
-
-        for W_delta_matrix in reversed(all_W_deltas):
-            flattenned_ordered_deltas = numpy.concatenate(
-                [flattenned_ordered_deltas, W_delta_matrix.flatten()]
-            )
-        for bias_d_vector in reversed(all_bias_deltas):
-            flattenned_ordered_deltas = numpy.concatenate(
-                [flattenned_ordered_deltas, bias_d_vector]
-            )
-        assert len(flattenned_ordered_deltas) == parameter_size
+        loss, flattenned_ordered_deltas = process_sample(
+            images[batch_index], labels[batch_index], initial_w
+        )
+        new_batch_loss += loss
+        print("Loss:", loss)
         cumulative_flattened_deltas += flattenned_ordered_deltas
-
-    apply_gradient()
-    print(cumulative_flattened_deltas[1000:1100])
-    print("parameters size", parameter_size_2)
+    print("batch loss", batch_loss, new_batch_loss)
     end_time = time.time()
     print(
         f"total time: {end_time - start_time}, per compute: {(end_time - start_time) / batch_size}"
