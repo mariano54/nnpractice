@@ -43,17 +43,12 @@ def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
 def process_sample(
     sample: NDArray[float32], label: int, network: NNWeightsNew
 ) -> Tuple[float32, NDArray[float32]]:
-    # print("\n\n\n")
-    # start_time = time.time()
     activations = compute_nn(sample, network)
     assert len(activations) == len(network.layers) + 1  # layers
     outputs = activations[-1]
     assert len(outputs) == 10
-    # print("1", 10000*(time.time() - start_time))
-    # start_time = time.time()
     y = np.zeros(len(outputs), dtype=float32)
     y[label] = 1.0
-    # print(f"correct: {label}")
     loss = calc_cross_entropy_loss(outputs, y)
 
     all_W_deltas = []
@@ -117,13 +112,11 @@ def train_model(
         parameter_size_2, dtype=float32
     )
     step_size = 0.00001
-    num_passes = 5
+    num_passes = 10
     for pass_i in range(num_passes):
         for batch in range(int(len(images) / batch_size)):
             batch_loss = 0.0
-            print(
-                f"Pass: {pass_i+1}/{num_passes} Processing batch {batch} with step size: {step_size}"
-            )
+
             for batch_index in range(batch_size):
                 image_index = batch * batch_size + batch_index
 
@@ -132,18 +125,28 @@ def train_model(
                 )
 
                 batch_loss += loss
+
                 cumulative_flattened_deltas += flattenned_ordered_deltas
 
+            print(
+                f"Pass: {pass_i + 1}/{num_passes} Processing batch {batch} with step size: {step_size}, loss: {batch_loss}"
+            )
             apply_gradient(
                 initial_w, (step_size / batch_size) * -1 * cumulative_flattened_deltas
             )
             step_size = batch_loss / 100000000
 
+        with open("weights.pkl", "wb") as f:
+            pickle.dump(initial_w, f)
+        print("Wrote model to: weights.pkl")
+
+        test_model("weights.pkl")
+
 
 def main():
     images, labels = load_data("train-images-idx3-ubyte", "train-labels-idx1-ubyte")
     print("Initializing weights")
-    initial_w = random_weights_nn(len(images[0]), [32, 10])
+    initial_w = random_weights_nn(len(images[0]), [50, 10])
 
     train_model(images, labels, initial_w)
 
