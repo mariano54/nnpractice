@@ -4,8 +4,6 @@ from numpy.typing import NDArray
 import numpy as np
 import math
 
-from load_data import load_data
-
 float32 = np.float32
 
 
@@ -36,7 +34,6 @@ def softmax(x: NDArray[float32]) -> NDArray[float32]:
     output = np.zeros(x.size, dtype=float32)
     for i, e in enumerate(exps):
         output[i] = e / denominator
-        # output.append(e / denominator)
     return output
 
 
