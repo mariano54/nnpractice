@@ -1,11 +1,10 @@
 import dataclasses
 import time
 from typing import List, Tuple
-
 import numpy
 from numpy.typing import NDArray
-
 import numpy as np
+import pickle
 
 float32 = np.float32
 
@@ -63,7 +62,7 @@ def calc_cross_entropy_loss(
     predicted: NDArray[float32], target: NDArray[float32]
 ) -> float32:
     assert len(predicted) == len(target)
-    return np.sum(
+    return -np.sum(
         [
             target[i] * (np.log(predicted[i]) if predicted[i] != 0 else 0)
             for i in range(len(predicted))
@@ -216,31 +215,25 @@ def train_model(
     cumulative_flattened_deltas: NDArray[float32] = np.zeros(
         parameter_size, dtype=float32
     )
-    batch_loss = 0.0
-    step_size = 0.001
+    step_size = 0.01
     for batch in range(1, 50):
+        batch_loss = 0.0
+        print(f"Processing batch {batch} with step size: {step_size}")
         for batch_index in range(batch_size):
-            print(f"Processed image {batch_index}")
             loss, flattenned_ordered_deltas = process_sample(
                 images[batch_index], labels[batch_index], initial_w
             )
             batch_loss += loss
-            print("Loss:", loss)
             cumulative_flattened_deltas += flattenned_ordered_deltas
 
-    print("batch loss", batch_loss)
-    apply_gradient(initial_w, step_size * -1 * cumulative_flattened_deltas)
+        print("batch loss", batch_loss)
+        apply_gradient(initial_w, (step_size/batch_size) * -1 * cumulative_flattened_deltas)
+        step_size = batch_loss / 20000
 
-    new_batch_loss = 0.0
-    for batch_index in range(batch_size):
-        print(f"Processed image {batch_index}")
-        loss, flattenned_ordered_deltas = process_sample(
-            images[batch_index], labels[batch_index], initial_w
-        )
-        new_batch_loss += loss
-        print("Loss:", loss)
-        cumulative_flattened_deltas += flattenned_ordered_deltas
-    print("batch loss", batch_loss, new_batch_loss)
+    with open("weights.pkl", "wb") as f:
+        pickle.dump(initial_w, f)
+
+
     end_time = time.time()
     print(
         f"total time: {end_time - start_time}, per compute: {(end_time - start_time) / batch_size}"
@@ -251,6 +244,9 @@ def main():
     images, labels = load_data()
     print("Initializing weights")
     initial_w = random_weights_nn(len(images[0]), [20, 25, 10])
+
+
+
     train_model(images, labels, initial_w)
 
 
