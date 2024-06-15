@@ -1,13 +1,14 @@
 from load_data import load_data
 import pickle
-from train_model import NNWeightsNew, Layer, compute_nn
+
+from neural_net import compute_nn
 
 
-def main():
-    images, labels = load_data("t10k-images-idx3-ubyte","t10k-labels-idx1-ubyte")
+def test_model(weights_filename: str):
+    images, labels = load_data("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte")
 
     print("Initializing weights")
-    with open("weights.pkl", "rb") as f:
+    with open(weights_filename, "rb") as f:
         weights = pickle.loads(f.read())
 
     failure = 0
@@ -21,6 +22,5 @@ def main():
     print(f"Error rate: {failure/len(images)}")
 
 
-
 if __name__ == "__main__":
-    main()
+    test_model("weights.pkl")

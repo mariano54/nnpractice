@@ -5,86 +5,19 @@ import numpy
 from numpy.typing import NDArray
 import numpy as np
 import pickle
+import math
 
 from load_data import load_data
+from neural_net import (
+    NNWeightsNew,
+    Layer,
+    compute_nn,
+    calc_cross_entropy_loss,
+    random_weights_nn,
+)
+from test_model import test_model
 
 float32 = np.float32
-
-
-@dataclasses.dataclass
-class Layer:
-    weights: NDArray[float32]  # 2d Array of weights: output x input
-    biases: NDArray[float32]  # added to the W x a
-
-
-@dataclasses.dataclass
-class NNWeightsNew:
-    layers: List[Layer]
-
-
-NNWeightsNew.__module__ = __name__  # provide name for pickling the class
-
-
-def relu(x: NDArray[float32]) -> NDArray[float32]:
-    return np.maximum(x, 0)
-
-
-def softmax(x: NDArray[float32]) -> NDArray[float32]:
-    exps = [np.exp(x_i) for x_i in x]
-    denominator = np.sum(exps) + 0.0001
-    output = np.zeros(x.size, dtype=float32)
-    for i, e in enumerate(exps):
-        output[i] = e / denominator
-        # output.append(e / denominator)
-    return output
-
-
-def compute_nn(x: NDArray[float32], network: NNWeightsNew) -> List[NDArray[float32]]:
-    activations: List[NDArray[float32]] = [x]
-    last_layer_outputs: NDArray[float32] = x
-    for layer_num, layer in enumerate(network.layers):
-        z: NDArray[float32] = (
-                layer.weights.dot(last_layer_outputs) + layer.biases
-        )  # type:ignore
-        next_layer_outputs = (
-            relu(z) if layer_num != len(network.layers) - 1 else softmax(z)
-        )
-
-        activations.append(next_layer_outputs)
-        last_layer_outputs = next_layer_outputs
-    return activations
-
-
-def calc_mse_loss(predicted: NDArray[float32], target: NDArray[float32]) -> float32:
-    assert len(predicted) == len(target)
-    total = float32(0)
-    for i in range(len(predicted)):
-        total += np.square(predicted[i] - target[i])
-    return total
-
-
-def calc_cross_entropy_loss(
-        predicted: NDArray[float32], target: NDArray[float32]
-) -> float32:
-    assert len(predicted) == len(target)
-    return -np.sum(
-        [
-            target[i] * (np.log(predicted[i]) if predicted[i] != 0 else 0)
-            for i in range(len(predicted))
-        ]
-    )
-
-
-def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsNew:
-    activation_size = data_size
-
-    all_layers: List[Layer] = []
-    for layer_num, layer_size in enumerate(layer_sizes):
-        weights = np.random.normal(0, 0.01, (layer_size, activation_size))
-        biases = np.random.normal(0, 0.01, layer_size)
-        all_layers.append(Layer(weights, biases))
-        activation_size = layer_size
-    return NNWeightsNew(all_layers)
 
 
 def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
@@ -92,7 +25,7 @@ def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
     processed = 0
     for layer in reversed(network.layers):
         num_biases = len(layer.biases)
-        bias_deltas = np.array(deltas[-(processed + num_biases + 1): -(processed + 1)])
+        bias_deltas = np.array(deltas[-(processed + num_biases + 1) : -(processed + 1)])
         all_bias_deltas.append(bias_deltas)
         processed += num_biases
     all_bias_deltas = list(reversed(all_bias_deltas))
@@ -101,7 +34,7 @@ def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
     for layer_i, layer in enumerate(network.layers):
         to_process = layer.weights.size
         flat_weight_deltas = np.array(
-            deltas[processed_w: (processed_w + to_process)], dtype=float32
+            deltas[processed_w : (processed_w + to_process)], dtype=float32
         )
         weight_deltas = flat_weight_deltas.reshape(layer.weights.shape)
         new_biases = layer.biases + all_bias_deltas[layer_i]
@@ -111,12 +44,12 @@ def apply_gradient(network: NNWeightsNew, deltas: NDArray[float32]):
 
 
 def process_sample(
-        sample: NDArray[float32], label: int, network: NNWeightsNew
+    sample: NDArray[float32], label: int, network: NNWeightsNew
 ) -> Tuple[float32, NDArray[float32]]:
     # print("\n\n\n")
     # start_time = time.time()
     activations = compute_nn(sample, network)
-    assert len(activations) == len(network.layers) +1  # layers
+    assert len(activations) == len(network.layers) + 1  # layers
     outputs = activations[-1]
     assert len(outputs) == 10
     # print("1", 10000*(time.time() - start_time))
@@ -128,6 +61,10 @@ def process_sample(
     # print("2", 10000*(time.time() - start_time))
     # start_time = time.time()
     loss = calc_cross_entropy_loss(outputs, y)
+    if math.isnan(loss):
+        print("activations:", activations)
+        print("Outputs:", outputs, y)
+        quit()
 
     all_W_deltas = []
     all_bias_deltas = []
@@ -169,7 +106,7 @@ def process_sample(
 
             start_time = time.time()
             new_deltas[k] = delta
-            W_deltas[k, :] = delta * activations[activation_index-1]
+            W_deltas[k, :] = delta * activations[activation_index - 1]
             bias_deltas[k] = delta
 
         # print("5.7", 10000*(time.time() - start_time))
@@ -196,39 +133,44 @@ def process_sample(
 
 
 def train_model(
-        images: List[NDArray[float32]], labels: List[int], initial_w: NNWeightsNew
+    images: List[NDArray[float32]], labels: List[int], initial_w: NNWeightsNew
 ):
-    batch_size: int = 1000
+    batch_size: int = 100
     # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
-    parameter_size_2 = (
-            (len(images[0]) + 1) * ls[0] + sum([(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)])
+    parameter_size_2 = (len(images[0]) + 1) * ls[0] + sum(
+        [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
     # assert parameter_size == parameter_size_2
 
     cumulative_flattened_deltas: NDArray[float32] = np.zeros(
         parameter_size_2, dtype=float32
     )
-    step_size = 0.001
-    for batch in range(0, 60):
-        batch_loss = 0.0
-        print(f"Processing batch {batch} with step size: {step_size}")
-        for batch_index in range(batch_size):
-            image_index = 0* batch_size + batch_index
+    step_size = 0.00001
+    num_passes = 5
+    for pass_i in range(num_passes):
+        for batch in range(int(len(images) / batch_size)):
+            batch_loss = 0.0
+            # print(
+            #     f"Pass: {pass_i+1}/{num_passes} Processing batch {batch} with step size: {step_size}"
+            # )
+            for batch_index in range(batch_size):
+                image_index = batch * batch_size + batch_index
 
-            loss, flattenned_ordered_deltas = process_sample(
-                images[image_index], labels[image_index], initial_w
+                loss, flattenned_ordered_deltas = process_sample(
+                    images[image_index], labels[image_index], initial_w
+                )
+
+                batch_loss += loss
+                cumulative_flattened_deltas += flattenned_ordered_deltas
+
+            # print("batch loss", batch_loss)
+            apply_gradient(
+                initial_w, (step_size / batch_size) * -1 * cumulative_flattened_deltas
             )
-
-
-            batch_loss += loss
-            cumulative_flattened_deltas += flattenned_ordered_deltas
-
-        print("batch loss", batch_loss)
-        apply_gradient(initial_w, (step_size / batch_size) * -1 * cumulative_flattened_deltas)
-        step_size = batch_loss / 400000
-
-
+            step_size = batch_loss / 100000000
+        print(f"Pass: {pass_i}")
+    test_model("weights.pkl")
 
 
 def main():
@@ -241,6 +183,8 @@ def main():
     with open("weights.pkl", "wb") as f:
         pickle.dump(initial_w, f)
     print("Wrote model to: weights.pkl")
+
+    test_model("weights.pkl")
 
 
 if __name__ == "__main__":
