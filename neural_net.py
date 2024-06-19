@@ -30,7 +30,9 @@ def softmax(x: NDArray[float32]) -> NDArray[float32]:
     for e in exps:
         if math.isnan(e):
             print("Xs:", x)
-    denominator = np.sum(exps) + 0.000001
+    denominator = np.sum(exps)
+    if denominator == 0:
+        denominator += 0.00001
     output = np.zeros(x.size, dtype=float32)
     for i, e in enumerate(exps):
         output[i] = e / denominator
