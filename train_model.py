@@ -1,3 +1,4 @@
+import time
 from typing import List, Tuple
 import numpy
 from numpy.typing import NDArray
@@ -45,21 +46,16 @@ def apply_gradient(
 
 
 def process_sample(
-    sample: NDArray[float32], label: int, network: NNWeightsNew
-) -> Tuple[float32, NDArray[float32]]:
-    activations = compute_nn(sample, network)
+    label: int, network: NNWeightsNew, activations: List[NDArray[float32]]
+) -> NDArray[float32]:
     assert len(activations) == len(network.layers) + 1  # layers
     outputs = activations[-1]
-    # assert len(outputs) == 10
     y = np.zeros(len(outputs), dtype=float32)
     y[label] = 1.0
-    loss = calc_cross_entropy_loss(outputs, y)
-    # print(f"x: {sample} output: {outputs} Loss: {loss}")
 
     all_W_deltas = []
     all_bias_deltas = []
     deltas = np.array([outputs[d] - y[d] for d in range(len(outputs))])
-    flattenned_ordered_deltas: NDArray[float32] = np.array([], dtype=float32)
 
     for layer_index in reversed(range(len(network.layers))):
         activation_index = layer_index + 1  # Activation also includes Xs in there
@@ -76,14 +72,14 @@ def process_sample(
         new_deltas = np.zeros(
             shape=(len(activations[activation_index])),
         )
-        for k in range(len(activations[activation_index])):
-            if activation_index != len(network.layers):
-                delta = deltas.dot(network.layers[layer_index + 1].weights[:, k]) * (
-                    1 if activations[activation_index][k] > 0 else 0
-                )
-            else:
-                delta = deltas[k]
+        if activation_index != len(network.layers):
+            deltas = deltas @ network.layers[layer_index + 1].weights
+            for k in range(len(deltas)):
+                if activations[activation_index][k] < 0:
+                    deltas[k] = 0
 
+        for k in range(len(activations[activation_index])):
+            delta = deltas[k]
             new_deltas[k] = delta
             W_deltas[k, :] = delta * activations[activation_index - 1]
             bias_deltas[k] = delta
@@ -91,15 +87,9 @@ def process_sample(
         all_W_deltas.append(W_deltas)
         all_bias_deltas.append(bias_deltas)
         deltas = new_deltas
-    for W_delta_matrix in reversed(all_W_deltas):
-        flattenned_ordered_deltas = numpy.concatenate(
-            [flattenned_ordered_deltas, W_delta_matrix.flatten()]
-        )
-    for bias_d_vector in reversed(all_bias_deltas):
-        flattenned_ordered_deltas = numpy.concatenate(
-            [flattenned_ordered_deltas, bias_d_vector]
-        )
-    return (loss, flattenned_ordered_deltas)
+
+    flattenned_ordered_deltas: NDArray[float32]  = numpy.concatenate([w.flatten() for w in reversed(all_W_deltas)] + list(reversed(all_bias_deltas)))
+    return flattenned_ordered_deltas
 
 
 def train_model(
@@ -108,36 +98,42 @@ def train_model(
     initial_w: NNWeightsNew,
 ):
     batch_size: int = 1000
-    # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
-    # assert parameter_size == parameter_size_2
 
-    step_size = 0.001
-    num_passes = 50
+    step_size = 0.00005
+    num_passes = 500
     for pass_i in range(num_passes):
 
         cumulative_flattened_deltas: NDArray[float32] = np.zeros(
             parameter_size_2, dtype=float32
         )
         for batch in range(int(len(dataset) / batch_size)):
-            batch_loss = 0.0
+            activations = []
+            to_log = []
+            for batch_index in range(batch_size):
+                image_index = batch * batch_size + batch_index
+                activations.append(compute_nn(dataset[image_index], initial_w))
+                predicted_prob = activations[-1][-1][labels[image_index]]
+                if predicted_prob == 0:
+                    to_log = 0.0001
+                to_log.append(activations[-1][-1][labels[image_index]])
+
+            batch_loss = sum(np.log(np.array(to_log)))
 
             for batch_index in range(batch_size):
                 image_index = batch * batch_size + batch_index
 
-                loss, flattenned_ordered_deltas = process_sample(
-                    dataset[image_index], labels[image_index], initial_w
+                flattenned_ordered_deltas = process_sample(
+                    labels[image_index], initial_w, activations[batch_index]
                 )
-
-                batch_loss += loss
 
                 cumulative_flattened_deltas += flattenned_ordered_deltas
 
             print(
-                f"\n\nPass: {pass_i + 1}/{num_passes} Processing batch {batch} with step size: {step_size}, "
+                f"Pass: {pass_i + 1}/{num_passes} Processing batch {batch} with step size: {step_size}, "
                 f"loss: {batch_loss/batch_size}"
             )
             apply_gradient(
@@ -145,13 +141,6 @@ def train_model(
                 (1.0 / batch_size) * -1 * cumulative_flattened_deltas,
                 step_size=step_size,
             )
-            if batch_loss < 0.5:
-                step_size = 0.00005
-            if batch_loss < 0.3:
-                step_size = 0.00002
-            if batch_loss < 0.2:
-                step_size = 0.00001
-            # step_size = batch_loss / 3000
 
         with open("weights.pkl", "wb") as f:
             pickle.dump(initial_w, f)
@@ -173,27 +162,6 @@ def main():
 
     test_model("weights.pkl")
 
-
-# def debug_stuff():
-#     Xs = [[1.0, 2.0], [3.0, 4.0], [5.0, 6.0], [1, 8], [2, 6], [8, 9], [1, 1], [3, 9]]
-#     Ys = [0, 0, 0, 1, 1, 0, 0, 1]
-#
-#     # initial_w = random_weights_nn(2, [4, 3])
-#
-#     # with open("test_weights.pkl", "wb") as f:
-#     #     pickle.dump(initial_w, f)
-#     # print("Wrote model to: weights.pkl")
-#
-#     with open("test_weights.pkl", "rb") as f:
-#         weights = pickle.loads(f.read())
-#
-#     print(weights)
-#     for i in range(len(Xs)):
-#         res = compute_nn(np.array(Xs[i]), weights)
-#         # print(res[-1])
-#
-#     train_model([np.array(x) for x in Xs], Ys, weights)
-#
 
 if __name__ == "__main__":
     main()
