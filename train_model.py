@@ -4,6 +4,7 @@ import numpy
 from numpy.typing import NDArray
 import numpy as np
 import pickle
+import torch
 
 from load_data import load_data
 from neural_net import (
@@ -16,6 +17,12 @@ from neural_net import (
 from test_model import test_model
 
 float32 = np.float32
+device = (
+    "cuda"
+    if torch.cuda.is_available()
+    else "mps" if torch.backends.mps.is_available() else "cpu"
+)
+print(f"Using {device} device")
 
 
 def apply_gradient(
@@ -59,36 +66,18 @@ def process_sample(
 
     for layer_index in reversed(range(len(network.layers))):
         activation_index = layer_index + 1  # Activation also includes Xs in there
-        W_deltas: NDArray[float32] = np.zeros(
-            shape=(
-                len(activations[activation_index]),
-                len(activations[activation_index - 1]),
-            ),
-            dtype=float32,
-        )
-        bias_deltas = np.zeros(
-            shape=(len(activations[activation_index])),
-        )
-        new_deltas = np.zeros(
-            shape=(len(activations[activation_index])),
-        )
         if activation_index != len(network.layers):
             deltas = deltas @ network.layers[layer_index + 1].weights
-            for k in range(len(deltas)):
-                if activations[activation_index][k] < 0:
+            for k in range(len(activations[activation_index])):
+                if activations[activation_index][k] <= 0:
                     deltas[k] = 0
 
-        for k in range(len(activations[activation_index])):
-            delta = deltas[k]
-            new_deltas[k] = delta
-            W_deltas[k, :] = delta * activations[activation_index - 1]
-            bias_deltas[k] = delta
-
+        W_deltas = np.outer(deltas, activations[activation_index - 1])
         all_W_deltas.append(W_deltas)
-        all_bias_deltas.append(bias_deltas)
-        deltas = new_deltas
-
-    flattenned_ordered_deltas: NDArray[float32]  = numpy.concatenate([w.flatten() for w in reversed(all_W_deltas)] + list(reversed(all_bias_deltas)))
+        all_bias_deltas.append(deltas.copy())
+    flattenned_ordered_deltas: NDArray[float32] = numpy.concatenate(
+        [w.flatten() for w in reversed(all_W_deltas)] + list(reversed(all_bias_deltas))
+    )
     return flattenned_ordered_deltas
 
 
@@ -97,14 +86,14 @@ def train_model(
     labels: List[int],
     initial_w: NNWeightsNew,
 ):
-    batch_size: int = 10000
+    batch_size: int = 1000
     # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
 
-    step_size = 0.0005
+    step_size = 0.00005
     num_passes = 500
     for pass_i in range(num_passes):
 
@@ -114,6 +103,7 @@ def train_model(
         for batch in range(int(len(dataset) / batch_size)):
             activations = []
             to_log = []
+            start_time = time.time()
             for batch_index in range(batch_size):
                 image_index = batch * batch_size + batch_index
                 activations.append(compute_nn(dataset[image_index], initial_w))
@@ -144,11 +134,11 @@ def train_model(
                 step_size=step_size,
             )
             if batch_loss < 0.5:
-                step_size = 0.0002
-            if batch_loss < 0.3:
                 step_size = 0.00002
-            if batch_loss < 0.2:
+            if batch_loss < 0.3:
                 step_size = 0.00001
+            if batch_loss < 0.2:
+                step_size = 0.000005
             # step_size = batch_loss / 3000
 
         with open("weights.pkl", "wb") as f:
@@ -160,7 +150,9 @@ def train_model(
 
 def main():
     images, labels = load_data("train-images-idx3-ubyte", "train-labels-idx1-ubyte")
+
     print("Initializing weights")
+
     initial_w = random_weights_nn(len(images[0]), [50, 10])
 
     train_model(images, labels, initial_w)
