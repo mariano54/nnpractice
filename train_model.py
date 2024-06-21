@@ -4,7 +4,6 @@ import numpy
 from numpy.typing import NDArray
 import numpy as np
 import pickle
-import torch
 
 from load_data import load_data
 from neural_net import (
@@ -17,12 +16,6 @@ from neural_net import (
 from test_model import test_model
 
 float32 = np.float32
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available() else "cpu"
-)
-print(f"Using {device} device")
 
 
 def apply_gradient(
@@ -73,10 +66,10 @@ def process_sample(
                     deltas[k] = 0
 
         W_deltas = np.outer(deltas, activations[activation_index - 1])
-        all_W_deltas.append(W_deltas)
-        all_bias_deltas.append(deltas.copy())
+        all_W_deltas.append(W_deltas.flatten())
+        all_bias_deltas.append(deltas)
     flattenned_ordered_deltas: NDArray[float32] = numpy.concatenate(
-        [w.flatten() for w in reversed(all_W_deltas)] + list(reversed(all_bias_deltas))
+        [w for w in reversed(all_W_deltas)] + list(reversed(all_bias_deltas))
     )
     return flattenned_ordered_deltas
 
@@ -86,14 +79,14 @@ def train_model(
     labels: List[int],
     initial_w: NNWeightsNew,
 ):
-    batch_size: int = 1000
+    batch_size: int = 10000
     # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
 
-    step_size = 0.00005
+    step_size = 0.0005
     num_passes = 500
     for pass_i in range(num_passes):
 
@@ -134,11 +127,11 @@ def train_model(
                 step_size=step_size,
             )
             if batch_loss < 0.5:
-                step_size = 0.00002
+                step_size = 0.00004
             if batch_loss < 0.3:
-                step_size = 0.00001
+                step_size = 0.00002
             if batch_loss < 0.2:
-                step_size = 0.000005
+                step_size = 0.00001
             # step_size = batch_loss / 3000
 
         with open("weights.pkl", "wb") as f:
