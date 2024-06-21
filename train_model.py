@@ -97,13 +97,14 @@ def train_model(
     labels: List[int],
     initial_w: NNWeightsNew,
 ):
-    batch_size: int = 1000
+    batch_size: int = 10000
+    # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
 
-    step_size = 0.00005
+    step_size = 0.0005
     num_passes = 500
     for pass_i in range(num_passes):
 
@@ -118,10 +119,11 @@ def train_model(
                 activations.append(compute_nn(dataset[image_index], initial_w))
                 predicted_prob = activations[-1][-1][labels[image_index]]
                 if predicted_prob == 0:
-                    to_log = 0.0001
-                to_log.append(activations[-1][-1][labels[image_index]])
+                    to_log.append(0.0001)
+                else:
+                    to_log.append(activations[-1][-1][labels[image_index]])
 
-            batch_loss = sum(np.log(np.array(to_log)))
+            batch_loss = -sum(np.log(np.array(to_log)))
 
             for batch_index in range(batch_size):
                 image_index = batch * batch_size + batch_index
@@ -141,6 +143,13 @@ def train_model(
                 (1.0 / batch_size) * -1 * cumulative_flattened_deltas,
                 step_size=step_size,
             )
+            if batch_loss < 0.5:
+                step_size = 0.0002
+            if batch_loss < 0.3:
+                step_size = 0.00002
+            if batch_loss < 0.2:
+                step_size = 0.00001
+            # step_size = batch_loss / 3000
 
         with open("weights.pkl", "wb") as f:
             pickle.dump(initial_w, f)

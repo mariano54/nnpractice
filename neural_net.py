@@ -66,13 +66,12 @@ def calc_mse_loss(predicted: NDArray[float32], target: NDArray[float32]) -> floa
 def calc_cross_entropy_loss(
     predicted: NDArray[float32], target: NDArray[float32]
 ) -> float32:
+    # TODO: log array insetad of one value
     assert len(predicted) == len(target)
-    return -np.sum(
-        [
-            target[i] * (np.log(predicted[i]) if predicted[i] != 0 else 0)
-            for i in range(len(predicted))
-        ]
-    )
+    for i in range(len(predicted)):
+        if target[i] != 0:
+            return -target[i] * (np.log(predicted[i]) if predicted[i] != 0 else 0)
+    # )
 
 
 def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsNew:
