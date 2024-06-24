@@ -2,6 +2,7 @@ import dataclasses
 from typing import List
 from numpy.typing import NDArray
 import numpy as np
+import torch
 import math
 
 float32 = np.float32
@@ -26,10 +27,8 @@ def relu(x: NDArray[float32]) -> NDArray[float32]:
 
 
 def softmax(x: NDArray[float32]) -> NDArray[float32]:
+    x = x - max(x)  # Prevent overflow
     exps = [np.exp(x_i) for x_i in x]
-    for e in exps:
-        if math.isnan(e):
-            print("Xs:", x)
     denominator = np.sum(exps)
     if denominator == 0:
         denominator += 0.00001
@@ -49,7 +48,6 @@ def compute_nn(x: NDArray[float32], network: NNWeightsNew) -> List[NDArray[float
         next_layer_outputs = (
             relu(z) if layer_num != len(network.layers) - 1 else softmax(z)
         )
-
         activations.append(next_layer_outputs)
         last_layer_outputs = next_layer_outputs
     return activations
@@ -79,8 +77,12 @@ def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsNew:
 
     all_layers: List[Layer] = []
     for layer_num, layer_size in enumerate(layer_sizes):
-        weights = np.random.normal(0, 0.01, (layer_size, activation_size))
-        biases = np.random.normal(0, 0.01, layer_size)
+        std_dev = math.sqrt(2) / math.sqrt(activation_size)
+        weights = np.random.normal(0, size=(layer_size, activation_size)) * std_dev
+        if layer_num == len(layer_sizes) - 1:
+            biases = np.zeros(layer_size)
+        else:
+            biases = np.random.normal(0, 1, layer_size) * std_dev
         all_layers.append(Layer(weights, biases))
         activation_size = layer_size
     return NNWeightsNew(all_layers)

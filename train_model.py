@@ -79,66 +79,70 @@ def train_model(
     labels: List[int],
     initial_w: NNWeightsNew,
 ):
-    batch_size: int = 10000
+    batch_size: int = 32
     # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
     ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
 
-    step_size = 0.0005
-    num_passes = 500
+    step_size = 0.3
+    num_passes = 20000
     for pass_i in range(num_passes):
-
         cumulative_flattened_deltas: NDArray[float32] = np.zeros(
             parameter_size_2, dtype=float32
         )
-        for batch in range(int(len(dataset) / batch_size)):
-            activations = []
-            to_log = []
-            start_time = time.time()
-            for batch_index in range(batch_size):
-                image_index = batch * batch_size + batch_index
-                activations.append(compute_nn(dataset[image_index], initial_w))
-                predicted_prob = activations[-1][-1][labels[image_index]]
-                if predicted_prob == 0:
-                    to_log.append(0.0001)
-                else:
-                    to_log.append(activations[-1][-1][labels[image_index]])
+        activations = []
+        to_log = []
+        image_indexes = np.random.choice(len(dataset), batch_size, replace=False)
+        for batch_index in range(batch_size):
+            image_index = image_indexes[batch_index]
+            activations.append(compute_nn(dataset[image_index], initial_w))
+            predicted_prob = activations[-1][-1][labels[image_index]]
+            if predicted_prob == 0:
+                to_log.append(0.0001)
+            else:
+                to_log.append(activations[-1][-1][labels[image_index]])
+            # print("loss", np.log(to_log[-1]))
+            # print("\n\n\n")
+            # if batch_index == 2:
+            #     quit()
 
-            batch_loss = -sum(np.log(np.array(to_log)))
+        batch_loss = -sum(np.log(np.array(to_log)))
 
-            for batch_index in range(batch_size):
-                image_index = batch * batch_size + batch_index
+        for batch_index in range(batch_size):
+            image_index = image_indexes[batch_index]
 
-                flattenned_ordered_deltas = process_sample(
-                    labels[image_index], initial_w, activations[batch_index]
-                )
+            flattenned_ordered_deltas = process_sample(
+                labels[image_index], initial_w, activations[batch_index]
+            )
 
-                cumulative_flattened_deltas += flattenned_ordered_deltas
-
+            cumulative_flattened_deltas += flattenned_ordered_deltas
+        if pass_i % 1000 == 0:
             print(
-                f"Pass: {pass_i + 1}/{num_passes} Processing batch {batch} with step size: {step_size}, "
+                f"Pass: {pass_i + 1}/{num_passes} Processing batch {pass_i} with step size: {step_size}, "
                 f"loss: {batch_loss/batch_size}"
             )
-            apply_gradient(
-                initial_w,
-                (1.0 / batch_size) * -1 * cumulative_flattened_deltas,
-                step_size=step_size,
-            )
-            if batch_loss < 0.5:
-                step_size = 0.00004
-            if batch_loss < 0.3:
-                step_size = 0.00002
-            if batch_loss < 0.2:
-                step_size = 0.00001
-            # step_size = batch_loss / 3000
+        apply_gradient(
+            initial_w,
+            (1.0 / batch_size) * -1 * cumulative_flattened_deltas,
+            step_size=step_size,
+        )
+        # if batch_loss < 0.5:
+        #     step_size = 0.00002
+        # if batch_loss < 0.3:
+        #     step_size = 0.00001
+        # if batch_loss < 0.2:
+        #     step_size = 0.000003
+        # if batch_loss < 0.1:
+        #     step_size = 0.000001
+        # step_size = batch_loss / 3000
+        if pass_i % 1000 == 0:
+            with open("weights.pkl", "wb") as f:
+                pickle.dump(initial_w, f)
+            print("Wrote model to: weights.pkl")
 
-        with open("weights.pkl", "wb") as f:
-            pickle.dump(initial_w, f)
-        print("Wrote model to: weights.pkl")
-
-        test_model("weights.pkl")
+            test_model("weights.pkl")
 
 
 def main():
