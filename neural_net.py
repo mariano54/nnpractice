@@ -25,7 +25,6 @@ NNWeightsNew.__module__ = __name__  # provide name for pickling the class
 def relu(x: NDArray[float32]) -> NDArray[float32]:
     return np.maximum(x, 0)
 
-
 def softmax(x: NDArray[float32]) -> NDArray[float32]:
     x = x - max(x)  # Prevent overflow
     exps = [np.exp(x_i) for x_i in x]
@@ -37,6 +36,12 @@ def softmax(x: NDArray[float32]) -> NDArray[float32]:
         output[i] = e / denominator
     return output
 
+def softmax_batch(x: NDArray[float32]) -> NDArray[float32]:
+    x = x - np.max(x, axis=1, keepdims=True)
+    exps = np.exp(x)
+    denominators = np.sum(exps, axis=1, keepdims=True)
+    return exps / denominators
+
 
 def compute_nn(x: NDArray[float32], network: NNWeightsNew) -> List[NDArray[float32]]:
     activations: List[NDArray[float32]] = [x]
@@ -47,6 +52,20 @@ def compute_nn(x: NDArray[float32], network: NNWeightsNew) -> List[NDArray[float
         )  # type:ignore
         next_layer_outputs = (
             relu(z) if layer_num != len(network.layers) - 1 else softmax(z)
+        )
+        activations.append(next_layer_outputs)
+        last_layer_outputs = next_layer_outputs
+    return activations
+
+def compute_nn_batch(xs: NDArray[float32], network: NNWeightsNew) -> List[NDArray[float32]]:
+    activations: List[NDArray[float32]] = [xs]  # 2d elements
+    last_layer_outputs: NDArray[float32] = xs # Two dimensional
+    for layer_num, layer in enumerate(network.layers):
+        z: NDArray[float32] = (
+            last_layer_outputs.dot(layer.weights.T) + layer.biases
+        )  # type:ignore
+        next_layer_outputs = (
+            relu(z) if layer_num != len(network.layers) - 1 else softmax_batch(z)
         )
         activations.append(next_layer_outputs)
         last_layer_outputs = next_layer_outputs

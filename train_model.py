@@ -11,7 +11,7 @@ from neural_net import (
     Layer,
     compute_nn,
     calc_cross_entropy_loss,
-    random_weights_nn,
+    random_weights_nn, compute_nn_batch,
 )
 from test_model import test_model
 
@@ -85,36 +85,29 @@ def train_model(
     parameter_size_2 = (len(dataset[0]) + 1) * ls[0] + sum(
         [(ls[i] + 1) * ls[i + 1] for i in range(0, len(ls) - 1)]
     )
-
-    step_size = 0.3
+    labels_np = np.array(labels)
+    step_size = 0.1
     num_passes = 20000
     for pass_i in range(num_passes):
+        if pass_i == 10000:
+            step_size = 0.01
+
         cumulative_flattened_deltas: NDArray[float32] = np.zeros(
             parameter_size_2, dtype=float32
         )
-        activations = []
-        to_log = []
         image_indexes = np.random.choice(len(dataset), batch_size, replace=False)
-        for batch_index in range(batch_size):
-            image_index = image_indexes[batch_index]
-            activations.append(compute_nn(dataset[image_index], initial_w))
-            predicted_prob = activations[-1][-1][labels[image_index]]
-            if predicted_prob == 0:
-                to_log.append(0.0001)
-            else:
-                to_log.append(activations[-1][-1][labels[image_index]])
-            # print("loss", np.log(to_log[-1]))
-            # print("\n\n\n")
-            # if batch_index == 2:
-            #     quit()
-
-        batch_loss = -sum(np.log(np.array(to_log)))
+        data_input = []
+        for img_index in image_indexes:
+            data_input.append(dataset[img_index])
+        activations = compute_nn_batch(np.array(data_input), initial_w)
+        batch_labels = labels_np[image_indexes]
+        batch_loss = -np.sum(np.log(activations[-1][np.arange(activations[-1].shape[0]), batch_labels]))
 
         for batch_index in range(batch_size):
             image_index = image_indexes[batch_index]
-
+            sample_activation = [activations[i][batch_index] for i in range(len(activations))]
             flattenned_ordered_deltas = process_sample(
-                labels[image_index], initial_w, activations[batch_index]
+                labels[image_index], initial_w, sample_activation
             )
 
             cumulative_flattened_deltas += flattenned_ordered_deltas
