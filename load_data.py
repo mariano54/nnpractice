@@ -1,14 +1,12 @@
 from typing import Tuple, List
 
-import numpy as np
-from numpy._typing import NDArray
-from numpy import float32
+import torch
 
 lookup_table = {}
 for i in range(256):
     lookup_table[i] = i/256.0
 
-def load_data(img_filename: str, label_filename: str) -> Tuple[List[NDArray[float32]], List[int]]:
+def load_data(img_filename: str, label_filename: str) -> Tuple[List[torch.Tensor], List[int]]:
     with open(img_filename, "rb") as f:
         data = f.read()
 
@@ -34,7 +32,7 @@ def load_data(img_filename: str, label_filename: str) -> Tuple[List[NDArray[floa
             print(f"Loaded {i} images")
         start_index = 16 + i * (rows * cols)
         image_bytes = data[start_index : start_index + rows * cols]
-        image_arr = np.array([lookup_table[byte] for byte in image_bytes])
+        image_arr = torch.tensor([lookup_table[byte] for byte in image_bytes]).float()
         images_py.append(image_arr)
     print("processed images")
     return images_py, labels

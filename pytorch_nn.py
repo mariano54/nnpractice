@@ -4,7 +4,6 @@ from os import abort
 import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
-from torchvision import datasets
 
 from neural_net import NNWeightsNew
 

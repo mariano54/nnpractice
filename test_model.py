@@ -1,7 +1,8 @@
 from load_data import load_data
+import torch
 import pickle
 
-from neural_net import compute_nn
+from neural_net import compute_nn_pytorch
 
 
 def test_model(weights_filename: str):
@@ -12,12 +13,17 @@ def test_model(weights_filename: str):
         weights = pickle.loads(f.read())
 
     failure = 0
-    for image, label in zip(images, labels):
-        activations = compute_nn(image, weights)
-        output = max((v, i) for i, v in enumerate(activations[-1]))[1]
+    batch_size = 32
+    for i in range(0, len(images), batch_size):
+        img_batch = torch.stack(images[i: i + batch_size])
+        labels_batch = torch.tensor(labels[i: i + batch_size])
+        real_batch_size = img_batch.shape[0]
 
-        if output != label:
-            failure += 1
+        _, activations = compute_nn_pytorch(img_batch, weights)
+
+        predictions = torch.argmax(activations[-1], dim=1)
+        pred_correct = torch.sum(predictions == labels_batch)
+        failure += (real_batch_size - pred_correct)
 
     print(f"Error rate: {failure/len(images)}")
 
