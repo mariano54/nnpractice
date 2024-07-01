@@ -36,6 +36,7 @@ class NeuralNetwork(nn.Module):
         self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(28 * 28, 50),
+            nn.BatchNorm1d(50),
             nn.ReLU(),
             nn.Linear(50, 10),
         )
@@ -65,31 +66,31 @@ def test_model(model):
 
 def main():
 
-    print("Initializing weights")
-    with open("weights.pkl", "rb") as f:
-        weights: NNWeightsTorch = pickle.loads(f.read())
+    # print("Initializing weights")
+    # with open("weights.pkl", "rb") as f:
+    #     weights: NNWeightsTorch = pickle.loads(f.read())
 
-    batch_size = 1
-    train_loader = DataLoader(train_data, batch_size=1, shuffle=False)
+    batch_size = 32
     model = NeuralNetwork().to(device)
 
-    for i, params in enumerate(list(model.parameters())):
-        if i == 0:
-            params.data = weights.layers[0].weights.float().to(device)
-        elif i == 1:
-            params.data = weights.layers[0].biases.float().to(device)
-        elif i == 2:
-            params.data = weights.layers[1].weights.float().to(device)
-        elif i == 3:
-            params.data = weights.layers[1].biases.float().to(device)
-        else:
-            print("fail")
-            abort()
+    # for i, params in enumerate(list(model.parameters())):
+    #     if i == 0:
+    #         params.data = weights.layers[0].weights.float().to(device)
+    #     elif i == 1:
+    #         params.data = weights.layers[0].biases.float().to(device)
+    #     elif i == 2:
+    #         params.data = weights.layers[1].weights.float().to(device)
+    #     elif i == 3:
+    #         params.data = weights.layers[1].biases.float().to(device)
+    #     else:
+    #         print("fail")
+    #         abort()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.01)
+    optimizer = optim.SGD(model.parameters(), lr=0.001)
     num_epochs = 500
     loss = 0
+    print("Starting training")
     for epoch in range(num_epochs):
         for batch_index in range(int(len(train_data_cuda) / batch_size)):
             inputs = train_data_cuda[
@@ -119,11 +120,10 @@ def main():
             # # quit()
             optimizer.step()
 
-        if epoch % 25 == 0:
+        if epoch % 1 == 0:
             print(f"Epoch {epoch} loss: {loss}")
             test_model(model)
 
 
 if __name__ == "__main__":
     main()
-

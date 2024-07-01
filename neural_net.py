@@ -26,13 +26,15 @@ def softmax_torch(x: torch.Tensor) -> torch.Tensor:
     return exps / denominators
 
 
-def compute_nn_pytorch(xs: torch.Tensor, network: NNWeightsTorch) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+def compute_nn_pytorch(
+    xs: torch.Tensor, network: NNWeightsTorch, device: str
+) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
     activations: List[torch.Tensor] = [xs]
     last_layer_outputs: torch.Tensor = xs  # Two dimensional
     zs: List[torch.Tensor] = []
     for layer_num, layer in enumerate(network.layers):
         z: torch.Tensor = (
-                last_layer_outputs @ layer.weights.T + layer.biases
+            last_layer_outputs @ layer.weights.T + layer.biases
         )  # type:ignore
         zs.append(z)
         next_layer_outputs = (
@@ -43,13 +45,17 @@ def compute_nn_pytorch(xs: torch.Tensor, network: NNWeightsTorch) -> Tuple[List[
     return zs, activations
 
 
-def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsTorch:
+def random_weights_nn(
+    data_size: int, layer_sizes: List[int], device: str
+) -> NNWeightsTorch:
     activation_size = data_size
 
     all_layers: List[LayerTorch] = []
     for layer_num, layer_size in enumerate(layer_sizes):
         std_dev = math.sqrt(2) / math.sqrt(activation_size)
-        weights = torch.normal(mean=0, std=std_dev, size=(layer_size, activation_size)).float()
+        weights = torch.normal(
+            mean=0, std=std_dev, size=(layer_size, activation_size)
+        ).float()
         # weights = np.random.normal(0, size=(layer_size, activation_size)) * std_dev
         if layer_num == len(layer_sizes) - 1:
             # biases = np.zeros(layer_size)
@@ -58,6 +64,6 @@ def random_weights_nn(data_size: int, layer_sizes: List[int]) -> NNWeightsTorch:
             # biases = np.random.normal(0, 1, layer_size) * std_dev
             biases = torch.normal(mean=0, std=1, size=(layer_size,)).float()
 
-        all_layers.append(LayerTorch(weights, biases))
+        all_layers.append(LayerTorch(weights.to(device), biases.to(device)))
         activation_size = layer_size
     return NNWeightsTorch(all_layers)
