@@ -5,7 +5,7 @@ import torch
 from torch import nn, optim
 from torch.utils.data import DataLoader
 
-from neural_net import NNWeightsNew
+from neural_net import NNWeightsTorch
 
 device = (
     "cuda"
@@ -67,7 +67,7 @@ def main():
 
     print("Initializing weights")
     with open("weights.pkl", "rb") as f:
-        weights: NNWeightsNew = pickle.loads(f.read())
+        weights: NNWeightsTorch = pickle.loads(f.read())
 
     batch_size = 1
     train_loader = DataLoader(train_data, batch_size=1, shuffle=False)
@@ -75,21 +75,21 @@ def main():
 
     for i, params in enumerate(list(model.parameters())):
         if i == 0:
-            params.data = torch.from_numpy(weights.layers[0].weights).float().to(device)
+            params.data = weights.layers[0].weights.float().to(device)
         elif i == 1:
-            params.data = torch.from_numpy(weights.layers[0].biases).float().to(device)
+            params.data = weights.layers[0].biases.float().to(device)
         elif i == 2:
-            params.data = torch.from_numpy(weights.layers[1].weights).float().to(device)
+            params.data = weights.layers[1].weights.float().to(device)
         elif i == 3:
-            params.data = torch.from_numpy(weights.layers[1].biases).float().to(device)
+            params.data = weights.layers[1].biases.float().to(device)
         else:
             print("fail")
             abort()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.0005)
+    optimizer = optim.SGD(model.parameters(), lr=0.01)
     num_epochs = 500
-
+    loss = 0
     for epoch in range(num_epochs):
         for batch_index in range(int(len(train_data_cuda) / batch_size)):
             inputs = train_data_cuda[
@@ -103,28 +103,27 @@ def main():
             # Forward pass
             outputs = model(inputs)
 
-            print("Output", model.softmax(outputs[0]))
+            # print("Output", model.softmax(outputs[0]))
             # Compute loss
             loss = criterion(outputs, labels)
-
-            print("Loss", loss)
             # Backward pass and optimization
             loss.backward()
 
-            print(list(model.parameters())[0].grad.flatten().tolist()[:200])
-            print("\n")
-            print(list(model.parameters())[1].grad.flatten().tolist()[:200])
-            print("\n")
-            print(list(model.parameters())[2].grad.flatten().tolist()[:200])
-            print("\n")
-            print(list(model.parameters())[3].grad.flatten().tolist()[:200])
-            quit()
+            # print(list(model.parameters())[0].grad.flatten().tolist()[:200])
+            # print("\n")
+            # print(list(model.parameters())[1].grad.flatten().tolist()[:200])
+            # print("\n")
+            # print(list(model.parameters())[2].grad.flatten().tolist()[:200])
+            # print("\n")
+            # print(list(model.parameters())[3].grad.flatten().tolist()[:200])
+            # # quit()
             optimizer.step()
 
         if epoch % 25 == 0:
-            print(f"Epoch {epoch}")
+            print(f"Epoch {epoch} loss: {loss}")
             test_model(model)
 
 
 if __name__ == "__main__":
     main()
+
