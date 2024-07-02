@@ -67,24 +67,12 @@ def backprop(
 def train_model(
     dataset: List[torch.Tensor],
     labels: List[int],
-    initial_w: NNWeightsTorch,
+    nn_torch: NNWeightsTorch,
 ):
     batch_size: int = 32
-    # parameter_size = 784 * 20 + 20 * 25 + 25 * 10 + (20 + 25 + 10)
-    ls = [initial_w.layers[l].weights.shape[0] for l in range(len(initial_w.layers))]
     labels_pytorch = torch.as_tensor(labels).to(device)
     step_size = 0.1
     num_passes = 40000
-
-    layers_torch = []
-    for layer in initial_w.layers:
-        w = layer.weights.to(device)
-        b = layer.biases.to(device)
-        w.requires_grad = False
-        b.requires_grad = False
-        layers_torch.append(LayerTorch(weights=w, biases=b))
-
-    nn_torch = NNWeightsTorch(layers_torch)
 
     # start_t = time.time()
     for pass_i in range(num_passes):
@@ -101,18 +89,18 @@ def train_model(
         zs, activations_pytorch = compute_nn_pytorch(
             torch.stack(data_input_torch).to(device), nn_torch, device
         )
-
-        batch_loss_2 = -torch.mean(
-            torch.log(activations_pytorch[-1][range(batch_size), batch_labels_pytorch])
-        )
+        backprop(zs, activations_pytorch, nn_torch, labels_pytorch[image_indexes])
 
         if pass_i % 250 == 0:
+            batch_loss_2 = -torch.mean(
+                torch.log(
+                    activations_pytorch[-1][range(batch_size), batch_labels_pytorch]
+                )
+            )
             print(
                 f"Pass: {pass_i + 1}/{num_passes} Processing batch {pass_i} with step size: {step_size}, "
                 f"loss: {batch_loss_2 / batch_size}"
             )
-
-        backprop(zs, activations_pytorch, nn_torch, labels_pytorch[image_indexes])
 
         if pass_i % 1000 == 0:
             with open("weights.pkl", "wb") as f:
