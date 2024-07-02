@@ -19,7 +19,7 @@ def test_model(weights_filename: str, device: str):
         labels_batch = torch.tensor(labels[i : i + batch_size]).to(device)
         real_batch_size = img_batch.shape[0]
 
-        _, activations = compute_nn_pytorch(img_batch, weights, device=device)
+        _, activations, _ = compute_nn_pytorch(img_batch, weights, device=device)
 
         predictions = torch.argmax(activations[-1], dim=1).to(device)
         pred_correct = torch.sum(predictions == labels_batch)

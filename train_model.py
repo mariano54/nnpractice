@@ -1,5 +1,5 @@
 import time
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 import torch
 import pickle
 
@@ -24,7 +24,7 @@ print(f"Using {device} device")
 
 def update_parameters(
     nerual_net: NNWeightsTorch,
-    gradients: List[Tuple[torch.Tensor, torch.Tensor]],
+    gradients: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]],
     step_size: torch.float32,
 ) -> None:
     for layer_i, layer in enumerate(nerual_net.layers):
@@ -35,6 +35,7 @@ def update_parameters(
 def backprop(
     zs: List[torch.Tensor],
     activations: List[torch.Tensor],
+    preact_list: List[Optional[torch.Tensor]],
     neural_net: NNWeightsTorch,
     labels: torch.Tensor,
 ) -> None:
@@ -42,25 +43,36 @@ def backprop(
     dlogits = softmax_torch(zs[-1])
     dlogits[range(n), labels] -= 1
     dlogits /= n
+    outputs = dlogits
 
-    all_gradients = []
-    for layer_i in reversed(range(1, len(activations) - 1)):
+    all_gradients: List[Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]] = []
+    for layer_i in reversed(range(len(activations) - 1)):
         activations_hidden = activations[layer_i]
 
-        dactivations_hidden = dlogits @ neural_net.layers[layer_i].weights
-        dw2 = activations_hidden.T @ dlogits
-        db2 = dlogits.sum(0)
-        dz = torch.zeros_like(zs[layer_i - 1])
-        over_zero = torch.nonzero(zs[layer_i - 1] > 0, as_tuple=False)
-        dz[over_zero[:, 0], over_zero[:, 1]] = 1
-        dz = dz * dactivations_hidden
-        xs = activations[layer_i - 1]
-        dw1 = xs.T @ dz
-        db1 = dz.sum(0)
+        # dhprebn = (
+        #     bngain
+        #     * bnvar_inv
+        #     / n
+        #     * (
+        #         n * dhpreact
+        #         - dhpreact.sum(0)
+        #         - n / (n - 1) * bnraw * (dhpreact * bnraw).sum(0)
+        #     )
+        # )
+        #
+        dw2 = activations_hidden.T @ outputs
+        db2 = outputs.sum(0)
+
+        all_gradients = [(dw2, db2, None)] + all_gradients
+        if layer_i != 0:
+            dz = torch.zeros_like(zs[layer_i - 1])
+            over_zero = torch.nonzero(zs[layer_i - 1] > 0, as_tuple=False)
+            dz[over_zero[:, 0], over_zero[:, 1]] = 1
+
+            dactivations_hidden = outputs @ neural_net.layers[layer_i].weights
+            outputs = dz * dactivations_hidden
         # assert db1.allclose(neural_net.layers[0].biases.grad.T)
         # assert dw1.allclose(neural_net.layers[0].weights.grad.T)
-
-        all_gradients.extend([(dw1, db1), (dw2, db2)])
     update_parameters(neural_net, all_gradients, 0.1)
 
 
@@ -86,10 +98,16 @@ def train_model(
         for img_index in image_indexes:
             data_input_torch.append((dataset[img_index]).float().to(device))
 
-        zs, activations_pytorch = compute_nn_pytorch(
+        zs, activations_pytorch, preact_list = compute_nn_pytorch(
             torch.stack(data_input_torch).to(device), nn_torch, device
         )
-        backprop(zs, activations_pytorch, nn_torch, labels_pytorch[image_indexes])
+        backprop(
+            zs,
+            activations_pytorch,
+            preact_list,
+            nn_torch,
+            labels_pytorch[image_indexes],
+        )
 
         if pass_i % 250 == 0:
             batch_loss_2 = -torch.mean(
@@ -115,7 +133,11 @@ def main():
 
     print("Initializing weights")
 
-    initial_w = random_weights_nn(len(images[0]), [50, 10], device)
+    initial_w = random_weights_nn(
+        len(images[0]),
+        [(50, False), (52, False), (10, False)],
+        device,
+    )
 
     train_model(images, labels, initial_w)
 
