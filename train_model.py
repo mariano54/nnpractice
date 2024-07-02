@@ -43,33 +43,25 @@ def backprop(
     dlogits[range(n), labels] -= 1
     dlogits /= n
 
-    # TODO: generalize to more hidden layers
-    activations_hidden = activations[-2]
+    all_gradients = []
+    for layer_i in reversed(range(1, len(activations) - 1)):
+        activations_hidden = activations[layer_i]
 
-    dactivations_hidden = dlogits @ neural_net.layers[-1].weights
+        dactivations_hidden = dlogits @ neural_net.layers[layer_i].weights
+        dw2 = activations_hidden.T @ dlogits
+        db2 = dlogits.sum(0)
+        dz = torch.zeros_like(zs[layer_i - 1])
+        over_zero = torch.nonzero(zs[layer_i - 1] > 0, as_tuple=False)
+        dz[over_zero[:, 0], over_zero[:, 1]] = 1
+        dz = dz * dactivations_hidden
+        xs = activations[layer_i - 1]
+        dw1 = xs.T @ dz
+        db1 = dz.sum(0)
+        # assert db1.allclose(neural_net.layers[0].biases.grad.T)
+        # assert dw1.allclose(neural_net.layers[0].weights.grad.T)
 
-    dw2 = activations_hidden.T @ dlogits
-
-    db2 = dlogits.sum(0)
-
-    dz = torch.zeros_like(zs[-2])
-
-    over_zero = torch.nonzero(zs[-2] > 0, as_tuple=False)
-
-    dz[over_zero[:, 0], over_zero[:, 1]] = 1
-
-    dz = dz * dactivations_hidden
-
-    xs = activations[0]
-
-    dw1 = xs.T @ dz
-    db1 = dz.sum(0)
-
-    # assert db1.allclose(neural_net.layers[0].biases.grad.T)
-    # assert dw1.allclose(neural_net.layers[0].weights.grad.T)
-
-    gradients = [(dw1, db1), (dw2, db2)]
-    update_parameters(neural_net, gradients, 0.1)
+        all_gradients.extend([(dw1, db1), (dw2, db2)])
+    update_parameters(neural_net, all_gradients, 0.1)
 
 
 def train_model(
