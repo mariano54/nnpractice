@@ -29,6 +29,19 @@ test_data = datasets.MNIST(root="data", train=False, transform=ToTensor())
 train_data_cuda = train_data.data.to(device)
 train_labels_cuda = train_data.targets.to(device)
 
+#
+# class PrintLayer(nn.Module):
+#     def __init__(self):
+#         super().__init__()
+#
+#     def forward(self, x):
+#         # print("Intermediate output:")
+#         # print(x.shape)
+#         # print(x)
+#         # print()
+#         return x
+#
+
 
 class NeuralNetwork(nn.Module):
     def __init__(self):
@@ -36,9 +49,13 @@ class NeuralNetwork(nn.Module):
         self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(28 * 28, 50),
-            nn.BatchNorm1d(50),
+            # PrintLayer(),
+            nn.BatchNorm1d(50, track_running_stats=True),
+            # PrintLayer(),
             nn.ReLU(),
+            # PrintLayer(),
             nn.Linear(50, 10),
+            # PrintLayer(),
         )
         self.softmax = nn.Softmax(dim=0)
 
@@ -54,46 +71,61 @@ class NeuralNetwork(nn.Module):
 
 
 def test_model(model):
-
-    outputs = model.forward(test_data.data.to(device)[:].float())
+    model.eval()
+    print(test_data.data[0].tolist())
+    normalized_test_data = test_data.data / 256
+    # print(f"Len of test data: {len(test_data.data)}")
+    outputs = model.forward(normalized_test_data.to(device)[:].float())
     fail = 0
     for img_i, output in enumerate(outputs):
+        # print(f"Outputs: {outputs}")
         output_i = max((v, i) for i, v in enumerate(output))[1]
         if output_i != test_data[img_i][1]:
             fail += 1
     print(f"Fail rate: {fail/len(outputs)}")
+    # quit()
+    model.train()
 
 
 def main():
 
-    # print("Initializing weights")
-    # with open("weights.pkl", "rb") as f:
-    #     weights: NNWeightsTorch = pickle.loads(f.read())
+    print("Initializing weights")
+    with open("weights.pkl", "rb") as f:
+        weights: NNWeightsTorch = pickle.loads(f.read())
 
     batch_size = 32
     model = NeuralNetwork().to(device)
-
-    # for i, params in enumerate(list(model.parameters())):
-    #     if i == 0:
-    #         params.data = weights.layers[0].weights.float().to(device)
-    #     elif i == 1:
-    #         params.data = weights.layers[0].biases.float().to(device)
-    #     elif i == 2:
-    #         params.data = weights.layers[1].weights.float().to(device)
-    #     elif i == 3:
-    #         params.data = weights.layers[1].biases.float().to(device)
-    #     else:
-    #         print("fail")
-    #         abort()
+    print("Prams length", len(list(model.parameters())))
+    for i, params in enumerate(list(model.parameters())):
+        if i == 0:
+            params.data = weights.layers[0].weights.float().to(device)
+        elif i == 1:
+            params.data = weights.layers[0].biases.float().to(device)
+        elif i == 2:
+            params.data = weights.layers[0].batch_norm[0].float().to(device)
+        elif i == 3:
+            params.data = weights.layers[0].batch_norm[1].float().to(device)
+        elif i == 4:
+            params.data = weights.layers[1].weights.float().to(device)
+        elif i == 5:
+            params.data = weights.layers[1].biases.float().to(device)
+        else:
+            print("fail")
+            abort()
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.SGD(model.parameters(), lr=0.001)
+    optimizer = optim.SGD(model.parameters(), lr=0.1)
     num_epochs = 500
     loss = 0
+    train_data_cuda_2 = train_data_cuda / 256
+    # print(f"l1 Biases: {list(model.parameters())[5]}")
+    print(f"l0 weights: {list(model.parameters())[0]}")
+
+    test_model(model)
     print("Starting training")
     for epoch in range(num_epochs):
-        for batch_index in range(int(len(train_data_cuda) / batch_size)):
-            inputs = train_data_cuda[
+        for batch_index in range(int(len(train_data_cuda_2) / batch_size)):
+            inputs = train_data_cuda_2[
                 batch_index * batch_size : (batch_index + 1) * batch_size
             ].float()
             labels = train_labels_cuda[
@@ -101,28 +133,51 @@ def main():
             ]
             optimizer.zero_grad()
 
+            # print("Inputs: ", inputs)
             # Forward pass
             outputs = model(inputs)
+            # print(outputs)
 
             # print("Output", model.softmax(outputs[0]))
             # Compute loss
             loss = criterion(outputs, labels)
+            # print("Loss", loss)
             # Backward pass and optimization
             loss.backward()
 
-            # print(list(model.parameters())[0].grad.flatten().tolist()[:200])
+            # print(list(model.parameters())[0].grad.flatten().tolist()[:5])
             # print("\n")
-            # print(list(model.parameters())[1].grad.flatten().tolist()[:200])
+            # print(list(model.parameters())[1].grad.flatten().tolist()[:5])
             # print("\n")
-            # print(list(model.parameters())[2].grad.flatten().tolist()[:200])
+            # print(list(model.parameters())[2].grad.flatten().tolist()[:5])
             # print("\n")
-            # print(list(model.parameters())[3].grad.flatten().tolist()[:200])
-            # # quit()
+            # print(
+            #     "w1 grad", list(model.parameters())[0].grad.flatten().tolist()[400:420]
+            # )
+            # print("b1 grad", list(model.parameters())[1].grad.flatten().tolist()[:5])
+            # print(
+            #     "gain grad",
+            #     list(model.parameters())[2].grad.shape,
+            #     list(model.parameters())[2].grad.tolist()[:5],
+            # )
+            # print(
+            #     "bias grad",
+            #     list(model.parameters())[3].grad.shape,
+            #     list(model.parameters())[3].grad.tolist()[:5],
+            # )
+            # print(f"RM: {model.linear_relu_stack[1].running_mean}")
+            # print(f"RV: {model.linear_relu_stack[1].running_var}")
+            # if batch_index == 10:
+            #     quit()
+            # quit()
+            # print("Old W", list(model.parameters())[0].flatten().tolist()[400:450])
             optimizer.step()
+        test_model(model)
+        # quit()
+        # print("New W", list(model.parameters())[0].flatten().tolist()[400:450])
 
-        if epoch % 1 == 0:
-            print(f"Epoch {epoch} loss: {loss}")
-            test_model(model)
+        # if epoch % 1 == 0:
+        # print(f"Epoch {epoch} loss: {loss}")
 
 
 if __name__ == "__main__":
