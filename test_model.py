@@ -38,4 +38,4 @@ if __name__ == "__main__":
         else "mps" if torch.backends.mps.is_available() else "cpu"
     )
     print(f"Using {device} device")
-    test_model_from_file("weights.pkl", device)
+    test_model_from_file("weights/weights.pkl", device)

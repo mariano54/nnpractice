@@ -56,7 +56,6 @@ def compute_nn_pytorch(
         if layer.batch_norm is not None:
             if training:
                 bn_mean = (1.0 / z.shape[0]) * (z.sum(0, keepdim=True))
-                assert bn_mean.shape == (1, 50)
                 bn_diff = z - bn_mean
                 bn_diff_sq = bn_diff**2
                 bn_var = (1.0 / z.shape[0]) * bn_diff_sq.sum(
