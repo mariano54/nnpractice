@@ -2,12 +2,12 @@
 .venv/
 __pycache__/
 data/
-t10k-images-idx3-ubyte
-t10k-labels-idx1-ubyte
+data/MNIST/t10k-images-idx3-ubyte
+data/MNIST/t10k-labels-idx1-ubyte
 test_weights.pkl
 torch_nn.py
 torch_testing.ipynb
-train-images-idx3-ubyte
-train-labels-idx1-ubyte
-weights.pkl
+data/MNIST/train-images-idx3-ubyte
+data/MNIST/train-labels-idx1-ubyte
+weights/weights.pkl
 weights_test.pkl
