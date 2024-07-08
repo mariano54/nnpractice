@@ -1,16 +1,15 @@
-import time
 from typing import List, Tuple, Optional
 import torch
 import pickle
 
-from load_data import load_data
-from neural_net import (
+from src.load_data import load_data
+from src.neural_net import (
     random_weights_nn,
     compute_nn_pytorch,
     NNWeightsTorch,
     softmax_torch,
 )
-from test_model import test_model
+from test.test_MNIST_performance import test_model
 
 device = (
     "cuda"
@@ -108,11 +107,13 @@ def train_model(
     labels: List[int],
     nn_torch: NNWeightsTorch,
     momentum=0.1,
+    num_passes=400000,
 ):
+    torch.manual_seed(1338)
+
     batch_size: int = 32
     labels_pytorch = torch.as_tensor(labels).to(device)
     step_size = 0.01
-    num_passes = 400000
     for layer in nn_torch.layers:
         layer.weights.requires_grad = False
         layer.biases.requires_grad = False
@@ -176,7 +177,7 @@ def main():
 
     initial_w = random_weights_nn(
         len(images[0]),
-        [(1000, True), (50, True), (10, False)],
+        [(100, True), (50, True), (10, False)],
         device,
     )
 
@@ -185,7 +186,7 @@ def main():
 
     train_model(images, labels, initial_w)
 
-    with open("weights/weights.pkl", "wb") as f:
+    with open("../weights/weights.pkl", "wb") as f:
         pickle.dump(initial_w, f)
     print("Wrote model to: weights.pkl")
 

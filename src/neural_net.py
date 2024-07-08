@@ -101,8 +101,10 @@ def compute_nn_pytorch(
 
 
 def random_weights_nn(
-    data_size: int, layer_sizes: List[Tuple[int, bool]], device: str
+    data_size: int, layer_sizes: List[Tuple[int, bool]], device: str, seed: Optional[int] = None
 ) -> NNWeightsTorch:
+    if seed is not None:
+        torch.manual_seed(seed)
     activation_size = data_size
 
     all_layers: List[LayerTorch] = []

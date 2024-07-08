@@ -13,15 +13,15 @@ def read_corpus(filename: str) -> Dict[int, str]:
         data = f.read().encode("utf-8")
 
 
-read_corpus("data/taylor_swift_wiki.txt")
+read_corpus("../data/taylor_swift_wiki.txt")
 
 encoding_map: Dict[str, int] = {}
 
-with open("weights/gpt2_encoder.json", "rb") as f:
+with open("../weights/gpt2_encoder.json", "rb") as f:
     for k, v in json.loads(f.read()).items():
         encoding_map[k] = v
 
-with open("weights/gpt2_vocab.bpe", "rb") as f:
+with open("../weights/gpt2_vocab.bpe", "rb") as f:
     merges: Dict[Tuple[str, str], int] = {tuple(l[:-1].decode("utf-8").split(' ')): i + 256 for i, l in
                                           enumerate(f.readlines()[1:])}
 

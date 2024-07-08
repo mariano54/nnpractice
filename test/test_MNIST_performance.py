@@ -1,8 +1,8 @@
-from load_data import load_data
+from src.load_data import load_data
 import torch
 import pickle
 
-from neural_net import compute_nn_pytorch, NNWeightsTorch
+from src.neural_net import compute_nn_pytorch, NNWeightsTorch
 
 
 def test_model_from_file(weights_filename: str, device_i: str):
@@ -38,4 +38,4 @@ if __name__ == "__main__":
         else "mps" if torch.backends.mps.is_available() else "cpu"
     )
     print(f"Using {device} device")
-    test_model_from_file("weights/weights.pkl", device)
+    test_model_from_file("../weights/weights.pkl", device)
