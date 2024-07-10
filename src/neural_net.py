@@ -57,10 +57,10 @@ class ModularNetwork:
                 Linear(None, None, False, 784, 1000),
                 BatchNorm(None, None, momentum, 1000),
                 Relu(),
-                Linear(None, None, True, 1000, 100),
-                BatchNorm(None, None, momentum, 100),
+                Linear(None, None, True, 1000, 50),
+                BatchNorm(None, None, momentum, 50),
                 Relu(),
-                Linear(None, None, True, 100, 10, zero_biases=True),
+                Linear(None, None, True, 50, 10, zero_biases=True),
             ]
         self.final_softmax = Softmax()
 
@@ -210,6 +210,77 @@ class Linear:
         self.bias -= learning_rate * self.dbias
 
 
+class LayerNorm:
+    def __init__(
+        self,
+        bn_gain: Optional[torch.Tensor],
+        bn_bias: Optional[torch.Tensor],
+        momentum: float,
+        layer_size: Optional[int] = None,
+    ):
+        assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
+        self.momentum = momentum
+        if bn_bias is not None:
+            self.bn_gain = bn_gain
+            self.bn_bias = bn_bias
+        else:
+            self.bn_gain = torch.randn((1, layer_size)).to(device) * 0.1 + 1.0
+            self.bn_bias = torch.randn((1, layer_size)).to(device) * 0.1
+        self.bn_var_inv = None  # Used in backprop
+        self.x_hat = None  # Used in backprop
+        self.d_bias = None
+        self.d_gain = None
+
+    def forward(
+        self,
+        z: torch.Tensor,
+        training: bool,
+    ) -> torch.Tensor:
+        bn_mean = (1.0 / z.shape[1]) * (z.sum(1, keepdim=True))
+        bn_diff = z - bn_mean
+        bn_diff_sq = bn_diff**2
+        bn_var = (1.0 / (z.shape[1])) * bn_diff_sq.sum(1, keepdim=True)
+
+        bn_var_inv = (bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)
+        x_hat = bn_diff * bn_var_inv
+        # preact = x_hat * self.bn_gain + self.bn_bias
+        preact = (
+            self.bn_gain
+            * (z - z.mean(1, keepdim=True))
+            / torch.sqrt(z.var(1, keepdim=True, unbiased=True) + 1e-5)
+            + self.bn_bias
+        )
+        self.bn_var_inv = bn_var_inv
+        self.x_hat = x_hat
+        return preact
+
+    def backward(self, doutput: torch.Tensor):
+        d_preact: torch.Tensor = doutput
+        assert self.bn_var_inv is not None
+        assert self.x_hat is not None
+        n = doutput.shape[1]
+        # The following is taken from
+        # github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipyn
+        dz = (
+            self.bn_gain
+            * self.bn_var_inv
+            / n
+            * (
+                n * d_preact
+                - d_preact.sum(0)
+                # - n / (n - 1) * To align with pytorch, keep this commented
+                - self.x_hat * (d_preact * self.x_hat).sum(1)
+            )
+        )
+        self.d_gain = (self.x_hat * d_preact).sum(1, keepdim=True)
+        self.d_bias = d_preact.sum(1, keepdim=True)
+        return dz
+
+    def apply_gradient(self, learning_rate: float):
+        self.bn_gain -= learning_rate * self.d_gain
+        self.bn_bias -= learning_rate * self.d_bias
+
+
 class BatchNorm:
     def __init__(
         self,
@@ -251,12 +322,7 @@ class BatchNorm:
 
         bn_var_inv = (bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)
         x_hat = bn_diff * bn_var_inv
-        preact = (
-            self.bn_gain
-            * (z - z.mean(0, keepdim=True))
-            / torch.sqrt(z.var(0, keepdim=True, unbiased=True) + 1e-5)
-            + self.bn_bias
-        )
+        preact = x_hat * self.bn_gain + self.bn_bias
         self.bn_var_inv = bn_var_inv
         self.x_hat = x_hat
 
@@ -295,3 +361,50 @@ class BatchNorm:
     def apply_gradient(self, learning_rate: float):
         self.bn_gain -= learning_rate * self.d_gain
         self.bn_bias -= learning_rate * self.d_bias
+
+
+def random_weights_nn(
+    data_size: int,
+    layer_sizes: List[Tuple[int, bool]],
+    device: str,
+    seed: Optional[int] = None,
+) -> NNWeightsTorch:
+    if seed is not None:
+        torch.manual_seed(seed)
+    activation_size = data_size
+
+    all_layers: List[LayerTorch] = []
+    for layer_num, (layer_size, has_batchnorm) in enumerate(layer_sizes):
+        std_dev = math.sqrt(2) / math.sqrt(activation_size)
+        weights = torch.normal(
+            mean=0, std=std_dev, size=(layer_size, activation_size)
+        ).float()
+        # weights = np.random.normal(0, size=(layer_size, activation_size)) * std_dev
+        if layer_num == len(layer_sizes) - 1:
+            # biases = np.zeros(layer_size)
+            biases = torch.zeros(layer_size).float()
+        else:
+            # biases = np.random.normal(0, 1, layer_size) * std_dev
+            biases = torch.normal(mean=0, std=1, size=(layer_size,)).float()
+
+        batch_norm = None
+        running_mean = None
+        running_var = None
+        if has_batchnorm:
+            bn_gain = torch.randn((1, layer_size)) * 0.1 + 1.0
+            bn_bias = torch.randn((1, layer_size)) * 0.1
+            batch_norm = (bn_gain.to(device), bn_bias.to(device))
+            running_mean = torch.zeros(layer_size).to(device)
+            running_var = torch.ones(layer_size).to(device)
+
+        all_layers.append(
+            LayerTorch(
+                weights.to(device),
+                biases.to(device),
+                batch_norm,
+                running_mean,
+                running_var,
+            )
+        )
+        activation_size = layer_size
+    return NNWeightsTorch(all_layers)

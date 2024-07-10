@@ -7,6 +7,7 @@ from src.neural_net import (
     NNWeightsTorch,
     ModularNetwork,
     device,
+    random_weights_nn,
 )
 from test.test_MNIST_performance import test_model
 
@@ -18,12 +19,18 @@ def train_model(
     num_passes=400000,
 ) -> ModularNetwork:
     torch.manual_seed(1338)
+    initial_w = random_weights_nn(
+        len(dataset[0]),
+        [(1000, True), (50, True), (10, False)],
+        device,
+    )
 
-    modular_network = ModularNetwork(None, momentum)
+    modular_network = ModularNetwork(initial_w, momentum)
     labels_pytorch = torch.as_tensor(labels).to(device)
     batch_size: int = 32
     step_size = 0.01
 
+    torch.manual_seed(2000)
     for pass_i in range(num_passes):
         if pass_i == 30000:
             step_size = 0.005
