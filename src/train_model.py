@@ -5,101 +5,11 @@ import pickle
 from src.load_data import load_data
 from src.neural_net import (
     random_weights_nn,
-    compute_nn_pytorch,
     NNWeightsTorch,
-    softmax_torch,
+    ModularNetwork,
+    device,
 )
 from test.test_MNIST_performance import test_model
-
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available() else "cpu"
-)
-print(f"Using {device} device")
-
-
-def update_parameters(
-    nerual_net: NNWeightsTorch,
-    gradients: List[
-        Tuple[
-            torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
-        ]
-    ],
-    step_size: torch.float32,
-) -> None:
-    for layer_i, layer in enumerate(nerual_net.layers):
-        layer.weights -= gradients[layer_i][0].T * step_size
-        layer.biases -= gradients[layer_i][1] * step_size
-        if gradients[layer_i][2] is not None:
-            assert gradients[layer_i][3] is not None
-            new_gain = layer.batch_norm[0] - gradients[layer_i][2] * step_size
-            new_bias = layer.batch_norm[1] - gradients[layer_i][3] * step_size
-            layer.batch_norm = (new_gain, new_bias)
-
-
-def backprop(
-    preacts: List[torch.Tensor],
-    all_activations: List[torch.Tensor],
-    preact_list: List[Optional[torch.Tensor]],
-    neural_net: NNWeightsTorch,
-    labels: torch.Tensor,
-    step_size: torch.float32,
-) -> None:
-
-    n = all_activations[-1].shape[0]
-    d_logits = softmax_torch(preacts[-1])
-    d_logits[range(n), labels] -= 1
-    d_preact = d_logits / n
-
-    # activations = act(z)  OR activations = act(batch_norm(z))
-    all_gradients: List[
-        Tuple[
-            torch.Tensor, torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]
-        ]
-    ] = []
-    for layer_i in reversed(range(len(all_activations) - 1)):
-        assert (preact_list[layer_i] is None) == (
-            neural_net.layers[layer_i].batch_norm is None
-        )
-        if neural_net.layers[layer_i].batch_norm is not None:
-            bnvar_inv: torch.Tensor = preact_list[layer_i][0]
-            bnraw: torch.Tensor = preact_list[layer_i][1]
-
-            # The following is taken from
-            # github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipyn
-            dz = (
-                neural_net.layers[layer_i].batch_norm[0]
-                * bnvar_inv
-                / n
-                * (
-                    n * d_preact
-                    - d_preact.sum(0)
-                    # - n / (n - 1) * To align with pytorch, keep this commented
-                    - bnraw * (d_preact * bnraw).sum(0)
-                )
-            )
-            d_gain = (bnraw * d_preact).sum(0, keepdim=True)
-            d_bias = d_preact.sum(0, keepdim=True)
-
-        else:
-            dz = d_preact
-            d_gain = None
-            d_bias = None
-
-        activations = all_activations[layer_i]
-
-        dw2 = activations.T @ dz
-        db2 = dz.sum(0)
-
-        all_gradients = [(dw2, db2, d_gain, d_bias)] + all_gradients
-        if layer_i != 0:
-            d_activations = dz @ neural_net.layers[layer_i].weights
-            dpreact_template = torch.zeros_like(preacts[layer_i - 1])
-            over_zero = torch.nonzero(preacts[layer_i - 1] > 0, as_tuple=False)
-            dpreact_template[over_zero[:, 0], over_zero[:, 1]] = 1
-            d_preact = dpreact_template * d_activations
-    update_parameters(neural_net, all_gradients, step_size)
 
 
 def train_model(
@@ -121,13 +31,14 @@ def train_model(
             layer.batch_norm[0].requires_grad = False
             layer.batch_norm[0].requires_grad = False
 
+    modular_network = ModularNetwork(nn_torch, momentum)
     for pass_i in range(num_passes):
-        if pass_i == 10000:
+        if pass_i == 50000:
             step_size = 0.005
-        if pass_i == 20000:
+        if pass_i == 200000:
             step_size = 0.001
-        if pass_i == 100000:
-            step_size = 0.0005
+        # if pass_i == 100000:
+        #     step_size = 0.0005
 
         image_indexes = torch.randperm(len(dataset))[:batch_size]
         batch_labels_pytorch = labels_pytorch[image_indexes]
@@ -136,38 +47,20 @@ def train_model(
         for img_index in image_indexes:
             data_input_torch.append((dataset[img_index]).float().to(device))
         input_data = torch.stack(data_input_torch).to(device)
-        preacts, activations_pytorch, preact_list, batch_means, batch_vars = (
-            compute_nn_pytorch(input_data, nn_torch, True)
-        )
-        for layer_i, (batch_mean, batch_var) in enumerate(zip(batch_means, batch_vars)):
-            if batch_mean is not None:
-                layer = nn_torch.layers[layer_i]
-                layer.running_mean = (1 - momentum) * layer.running_mean + (
-                    momentum * batch_mean
-                )
-                layer.running_var = (1 - momentum) * layer.running_var + (
-                    momentum * batch_var
-                )
-        backprop(
-            preacts,
-            activations_pytorch,
-            preact_list,
-            nn_torch,
-            labels_pytorch[image_indexes],
-            step_size,
-        )
+
+        probs = modular_network.forward(input_data)
+        modular_network.backward(batch_labels_pytorch)
+        modular_network.apply_gradient(step_size)
         if pass_i % 2000 == 0:
             batch_loss_2 = -torch.mean(
-                torch.log(
-                    activations_pytorch[-1][range(batch_size), batch_labels_pytorch]
-                )
+                torch.log(probs[range(batch_size), batch_labels_pytorch])
             )
             print(
                 f"Pass: {pass_i + 1}/{num_passes} Processing batch {pass_i} with step size: {step_size}, "
                 f"loss: {batch_loss_2 / batch_size}"
             )
 
-            test_model(nn_torch, device_i=device)
+            test_model(modular_network, device_i=device)
 
 
 def main():
@@ -178,7 +71,7 @@ def main():
     initial_w = random_weights_nn(
         len(images[0]),
         [(100, True), (50, True), (10, False)],
-        device,
+        seed=12345,
     )
 
     # with open("weights.pkl", "rb") as f:
