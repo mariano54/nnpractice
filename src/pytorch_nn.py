@@ -29,18 +29,18 @@ test_data = datasets.MNIST(root="data", train=False, transform=ToTensor())
 train_data_cuda = train_data.data.to(device)
 train_labels_cuda = train_data.targets.to(device)
 
-#
-# class PrintLayer(nn.Module):
-#     def __init__(self):
-#         super().__init__()
-#
-#     def forward(self, x):
-#         # print("Intermediate output:")
-#         # print(x.shape)
-#         # print(x)
-#         # print()
-#         return x
-#
+
+class PrintLayer(nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, x):
+        print("Intermediate output:")
+        print(x.shape)
+        print(x[0])
+        # print()
+        return x
+
 
 
 class NeuralNetwork(nn.Module):
@@ -48,13 +48,13 @@ class NeuralNetwork(nn.Module):
         super().__init__()
         self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
-            nn.Linear(28 * 28, 50),
+            nn.Linear(28 * 28, 1000),
             # PrintLayer(),
-            nn.BatchNorm1d(50, track_running_stats=True),
+            nn.LayerNorm(1000),
             # PrintLayer(),
             nn.ReLU(),
             # PrintLayer(),
-            nn.Linear(50, 10),
+            nn.Linear(1000, 10),
             # PrintLayer(),
         )
         self.softmax = nn.Softmax(dim=0)
@@ -90,7 +90,7 @@ def test_model(model):
 def main():
 
     print("Initializing weights")
-    with open("weights.pkl", "rb") as f:
+    with open("./weights/weights.pkl", "rb") as f:
         weights: NNWeightsTorch = pickle.loads(f.read())
 
     batch_size = 32
@@ -102,9 +102,9 @@ def main():
         elif i == 1:
             params.data = weights.layers[0].biases.float().to(device)
         elif i == 2:
-            params.data = weights.layers[0].batch_norm[0].float().to(device)
+            params.data = weights.layers[0].batch_norm[0].float().to(device).sum(0)
         elif i == 3:
-            params.data = weights.layers[0].batch_norm[1].float().to(device)
+            params.data = weights.layers[0].batch_norm[1].float().to(device).sum(0)
         elif i == 4:
             params.data = weights.layers[1].weights.float().to(device)
         elif i == 5:
@@ -116,12 +116,12 @@ def main():
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.SGD(model.parameters(), lr=0.1)
     num_epochs = 500
-    loss = 0
     train_data_cuda_2 = train_data_cuda / 256
-    # print(f"l1 Biases: {list(model.parameters())[5]}")
-    print(f"l0 weights: {list(model.parameters())[0]}")
+    print(f"Gain: {list(model.parameters())[2][:10]}")
+    print(f"Bias: {list(model.parameters())[3][:10]}")
+    # print(f"l0 weights: {list(model.parameters())[0]}")
 
-    test_model(model)
+    # test_model(model)
     print("Starting training")
     for epoch in range(num_epochs):
         for batch_index in range(int(len(train_data_cuda_2) / batch_size)):
@@ -138,20 +138,25 @@ def main():
             outputs = model(inputs)
             # print(outputs)
 
-            # print("Output", model.softmax(outputs[0]))
+            print("Output", model.softmax(outputs[0]))
             # Compute loss
             loss = criterion(outputs, labels)
-            # print("Loss", loss)
+            print("Loss", loss)
+
             # Backward pass and optimization
             loss.backward()
+            for name, param in model.linear_relu_stack.named_parameters():
+                if param.grad is not None:
+                    print(f"Gradient for {name}: {param.grad[:10]}")
 
-            # print(list(model.parameters())[0].grad.flatten().tolist()[:5])
-            # print("\n")
-            # print(list(model.parameters())[1].grad.flatten().tolist()[:5])
-            # print("\n")
-            # print(list(model.parameters())[2].grad.flatten().tolist()[:5])
-            # print("\n")
-            # print(
+            # print("w1 grad", list(model.parameters())[0].grad.flatten().tolist()[:5])
+            # # print("\n")
+            # print("b1 grad", list(model.parameters())[1].grad.flatten().tolist()[:5])
+            # # print("\n")
+            # print("gain grad:", list(model.parameters())[2].grad.flatten().tolist()[:5])
+            # print("bias grad", list(model.parameters())[3].grad.flatten().tolist()[:5])
+            # # print("\n")
+            # # print(
             #     "w1 grad", list(model.parameters())[0].grad.flatten().tolist()[400:420]
             # )
             # print("b1 grad", list(model.parameters())[1].grad.flatten().tolist()[:5])
@@ -170,8 +175,15 @@ def main():
             # if batch_index == 10:
             #     quit()
             # quit()
-            # print("Old W", list(model.parameters())[0].flatten().tolist()[400:450])
             optimizer.step()
+            print("new W", list(model.parameters())[0].flatten().tolist()[400:450])
+            print("new bias", list(model.parameters())[1][0:10])
+            print("new gain", list(model.parameters())[2][0:10])
+            print("new lnbias", list(model.parameters())[3][0:10])
+
+            if batch_index == 1:
+                quit()
+
         test_model(model)
         # quit()
         # print("New W", list(model.parameters())[0].flatten().tolist()[400:450])

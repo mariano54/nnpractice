@@ -37,30 +37,19 @@ class ModularNetwork:
                     weights.layers[0].biases,
                     compute_dx=False,
                 ),
-                BatchNorm(
-                    weights.layers[0].batch_norm[0],
-                    weights.layers[0].batch_norm[1],
-                    momentum,
-                ),
+                LayerNorm(weights.layers[0].batch_norm[0], weights.layers[0].batch_norm[1]),
                 Relu(),
                 Linear(weights.layers[1].weights, weights.layers[1].biases),
-                BatchNorm(
-                    weights.layers[1].batch_norm[0],
-                    weights.layers[1].batch_norm[1],
-                    momentum,
-                ),
-                Relu(),
-                Linear(weights.layers[2].weights, weights.layers[2].biases),
             ]
         else:
             self.layers = [
                 Linear(None, None, False, 784, 1000),
-                BatchNorm(None, None, momentum, 1000),
+                LayerNorm(None, None, 1000),
                 Relu(),
-                Linear(None, None, True, 1000, 50),
-                BatchNorm(None, None, momentum, 50),
-                Relu(),
-                Linear(None, None, True, 50, 10, zero_biases=True),
+                # Linear(None, None, True, 1000, 50),
+                # BatchNorm(None, None, momentum, 50),
+                # Relu(),
+                Linear(None, None, True, 1000, 10, zero_biases=True),
             ]
         self.final_softmax = Softmax()
 
@@ -81,6 +70,7 @@ class ModularNetwork:
                 ]
             )
         )
+        # loss.backward()
         doutput = self.final_softmax.backward_cross_entropy(labels)
         for layer in reversed(self.layers):
             doutput = layer.backward(doutput)
@@ -195,7 +185,6 @@ class Linear:
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
         self.last_inputs = xs
         ret = xs @ self.weights.T + self.bias
-        # print("Linear, output: ", ret[0][0:10])
         return ret
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
@@ -215,11 +204,9 @@ class LayerNorm:
         self,
         bn_gain: Optional[torch.Tensor],
         bn_bias: Optional[torch.Tensor],
-        momentum: float,
         layer_size: Optional[int] = None,
     ):
         assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
-        self.momentum = momentum
         if bn_bias is not None:
             self.bn_gain = bn_gain
             self.bn_bias = bn_bias
@@ -236,45 +223,49 @@ class LayerNorm:
         z: torch.Tensor,
         training: bool,
     ) -> torch.Tensor:
-        bn_mean = (1.0 / z.shape[1]) * (z.sum(1, keepdim=True))
-        bn_diff = z - bn_mean
-        bn_diff_sq = bn_diff**2
-        bn_var = (1.0 / (z.shape[1])) * bn_diff_sq.sum(1, keepdim=True)
+        bn_mean = (1.0 / z.shape[1]) * (z.sum(1, keepdim=True)) # 32x1
+        self.bn_diff = z - bn_mean # 32x1000
+        self.bn_diff_sq = self.bn_diff**2 # 32x1000
+        self.bn_var = (1.0 / (z.shape[1])) * self.bn_diff_sq.sum(1, keepdim=True) #32x1
 
-        bn_var_inv = (bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)
-        x_hat = bn_diff * bn_var_inv
-        # preact = x_hat * self.bn_gain + self.bn_bias
-        preact = (
-            self.bn_gain
-            * (z - z.mean(1, keepdim=True))
-            / torch.sqrt(z.var(1, keepdim=True, unbiased=True) + 1e-5)
-            + self.bn_bias
-        )
-        self.bn_var_inv = bn_var_inv
-        self.x_hat = x_hat
+        self.bn_var_inv = (self.bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+        self.x_hat = self.bn_diff * self.bn_var_inv #32x1000
+        preact = self.x_hat * self.bn_gain + self.bn_bias #32x1000
         return preact
 
     def backward(self, doutput: torch.Tensor):
         d_preact: torch.Tensor = doutput
         assert self.bn_var_inv is not None
         assert self.x_hat is not None
-        n = doutput.shape[1]
+        n = doutput.shape[0]
+        layer_size = doutput.shape[1]
+
+        d_xhatdL = self.bn_gain * d_preact
+        d_bnvarinvdL = (self.bn_diff * d_xhatdL).sum(1, keepdim=True)
+        d_bnvardL = (-0.5 * (self.bn_var + 1e-5) ** (-1.5)) * d_bnvarinvdL
+        d_bndiffsqrdL = (1.0 / (layer_size)) * d_bnvardL.expand(n, layer_size)
+        d_bndiffdL = self.bn_var_inv *d_xhatdL + (2 * self.bn_diff) * d_bndiffsqrdL
+        d_bn_meandL = (-1 * d_bndiffdL).sum(1, keepdim=True)
+        d_z = d_bndiffdL + (1/layer_size)*d_bn_meandL.expand(n, layer_size)
+
+        self.d_gain = (self.x_hat * d_preact).sum(0, keepdim=True)
+        self.d_bias = d_preact.sum(0, keepdim=True)
         # The following is taken from
-        # github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipyn
-        dz = (
-            self.bn_gain
-            * self.bn_var_inv
-            / n
-            * (
-                n * d_preact
-                - d_preact.sum(0)
-                # - n / (n - 1) * To align with pytorch, keep this commented
-                - self.x_hat * (d_preact * self.x_hat).sum(1)
-            )
-        )
-        self.d_gain = (self.x_hat * d_preact).sum(1, keepdim=True)
-        self.d_bias = d_preact.sum(1, keepdim=True)
-        return dz
+        # github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipynbo
+        # dz = (
+        #     self.bn_gain
+        #     * self.bn_var_inv
+        #     / n
+        #     * (
+        #         n * d_preact
+        #         - d_preact.sum(0)
+        #         # - n / (n - 1) * To align with pytorch, keep this commented
+        #         - n/ (n-1)
+        #         - self.x_hat * (d_preact * self.x_hat).sum(0)
+        #     )
+        # )
+
+        return d_z
 
     def apply_gradient(self, learning_rate: float):
         self.bn_gain -= learning_rate * self.d_gain
@@ -379,12 +370,9 @@ def random_weights_nn(
         weights = torch.normal(
             mean=0, std=std_dev, size=(layer_size, activation_size)
         ).float()
-        # weights = np.random.normal(0, size=(layer_size, activation_size)) * std_dev
         if layer_num == len(layer_sizes) - 1:
-            # biases = np.zeros(layer_size)
             biases = torch.zeros(layer_size).float()
         else:
-            # biases = np.random.normal(0, 1, layer_size) * std_dev
             biases = torch.normal(mean=0, std=1, size=(layer_size,)).float()
 
         batch_norm = None
