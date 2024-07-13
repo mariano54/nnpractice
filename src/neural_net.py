@@ -39,6 +39,7 @@ class ModularNetwork:
                 ),
                 LayerNorm(weights.layers[0].batch_norm[0], weights.layers[0].batch_norm[1]),
                 Relu(),
+                Dropout(0.5),
                 Linear(weights.layers[1].weights, weights.layers[1].biases),
             ]
         else:
@@ -46,6 +47,7 @@ class ModularNetwork:
                 Linear(None, None, False, 784, 1000),
                 LayerNorm(None, None, 1000),
                 Relu(),
+                Dropout(0.5),
                 # Linear(None, None, True, 1000, 50),
                 # BatchNorm(None, None, momentum, 50),
                 # Relu(),
@@ -353,6 +355,26 @@ class BatchNorm:
         self.bn_gain -= learning_rate * self.d_gain
         self.bn_bias -= learning_rate * self.d_bias
 
+class Dropout:
+    def __init__(self, dropout_prob: float):
+        self.dropout_prob = dropout_prob
+        self.dropout_tensor = None
+
+    def forward(self, x: torch.Tensor, training: bool):
+        if not training:
+            return x
+        prob_tensor = torch.full(x.shape, 1-self.dropout_prob).to(device)
+        self.dropout_tensor = torch.bernoulli(prob_tensor).to(device)
+        result = self.dropout_tensor * (1 / (1 - self.dropout_prob)) * x
+        return result
+
+    def backward(self, doutput: torch.Tensor):
+        assert self.dropout_tensor is not None
+        dx = doutput * self.dropout_tensor * (1 / (1 - self.dropout_prob))
+        return dx
+
+    def apply_gradient(self, learning_rate: float):
+        pass
 
 def random_weights_nn(
     data_size: int,

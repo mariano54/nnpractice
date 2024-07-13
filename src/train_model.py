@@ -4,10 +4,8 @@ import pickle
 
 from src.load_data import load_data
 from src.neural_net import (
-    NNWeightsTorch,
     ModularNetwork,
-    device,
-    random_weights_nn,
+    device, random_weights_nn,
 )
 from test.test_MNIST_performance import test_model
 
@@ -20,18 +18,18 @@ def train_model(
 ) -> ModularNetwork:
     torch.manual_seed(1338)
 
-    # initial_w = random_weights_nn(
-    #     len(dataset[0]),
-    #     [(1000, True), (10, False)],
-    #     device,
-    # )
+    initial_w = random_weights_nn(
+        len(dataset[0]),
+        [(1000, True), (10, False)],
+        device,
+    )
     #
     # with open("./weights/weights.pkl", "wb") as f:
     #     pickle.dump(initial_w, f)
     # print("Wrote model to: weights.pkl")
 
-    with open("./weights/weights.pkl", "rb") as f:
-        initial_w = pickle.loads(f.read())
+    # with open("./weights/weights.pkl", "rb") as f:
+    #     initial_w = pickle.loads(f.read())
 
     # initial_w.layers[0].weights.requires_grad = True
     # initial_w.layers[0].biases.requires_grad = True
@@ -40,7 +38,7 @@ def train_model(
     # initial_w.layers[1].weights.requires_grad = True
     # initial_w.layers[1].biases.requires_grad = True
     # print(initial_w.layers[0].batch)
-    modular_network = ModularNetwork(initial_w, momentum)
+    modular_network = ModularNetwork(None, momentum)
     labels_pytorch = torch.as_tensor(labels).to(device)
     batch_size: int = 32
     step_size = 0.1
@@ -48,12 +46,12 @@ def train_model(
     torch.manual_seed(2000)
     # print("original bn gain", modular_network.layers[1].bn_gain[:10])
     for pass_i in range(num_passes):
-        if pass_i == 30000:
-            step_size = 0.01
-        if pass_i == 70000:
-            step_size = 0.005
-        if pass_i == 100000:
-            step_size = 0.001
+        # if pass_i == 30000:
+        #     step_size = 0.01
+        # if pass_i == 70000:
+        #     step_size = 0.005
+        # if pass_i == 100000:
+        #     step_size = 0.001
 
         image_indexes = torch.randperm(len(dataset))[:batch_size]
         # image_indexes = torch.arange(32*pass_i, 32*(pass_i + 1))
@@ -62,8 +60,8 @@ def train_model(
         data_input_torch = []
         for img_index in image_indexes:
             data_input_torch.append((dataset[img_index]).float().to(device))
-        for d in data_input_torch:
-            d.requires_grad = True
+        # for d in data_input_torch:
+        #     d.requires_grad = True
         input_data = torch.stack(data_input_torch).to(device)
 
         probs = modular_network.forward(input_data)

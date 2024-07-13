@@ -53,6 +53,7 @@ class NeuralNetwork(nn.Module):
             nn.LayerNorm(1000),
             # PrintLayer(),
             nn.ReLU(),
+            nn.Dropout(p=0.5),
             # PrintLayer(),
             nn.Linear(1000, 10),
             # PrintLayer(),
@@ -118,7 +119,7 @@ def main():
     num_epochs = 500
     train_data_cuda_2 = train_data_cuda / 256
     print(f"Gain: {list(model.parameters())[2][:10]}")
-    print(f"Bias: {list(model.parameters())[3][:10]}")
+    # print(f"Bias: {list(model.parameters())[3][:10]}")
     # print(f"l0 weights: {list(model.parameters())[0]}")
 
     # test_model(model)
@@ -138,16 +139,16 @@ def main():
             outputs = model(inputs)
             # print(outputs)
 
-            print("Output", model.softmax(outputs[0]))
+            # print("Output", model.softmax(outputs[0]))
             # Compute loss
             loss = criterion(outputs, labels)
-            print("Loss", loss)
+            # print("Loss", loss)
 
             # Backward pass and optimization
             loss.backward()
-            for name, param in model.linear_relu_stack.named_parameters():
-                if param.grad is not None:
-                    print(f"Gradient for {name}: {param.grad[:10]}")
+            # for name, param in model.linear_relu_stack.named_parameters():
+            #     if param.grad is not None:
+            #         print(f"Gradient for {name}: {param.grad[:10]}")
 
             # print("w1 grad", list(model.parameters())[0].grad.flatten().tolist()[:5])
             # # print("\n")
@@ -176,13 +177,13 @@ def main():
             #     quit()
             # quit()
             optimizer.step()
-            print("new W", list(model.parameters())[0].flatten().tolist()[400:450])
-            print("new bias", list(model.parameters())[1][0:10])
-            print("new gain", list(model.parameters())[2][0:10])
-            print("new lnbias", list(model.parameters())[3][0:10])
-
-            if batch_index == 1:
-                quit()
+            # print("new W", list(model.parameters())[0].flatten().tolist()[400:450])
+            # print("new bias", list(model.parameters())[1][0:10])
+            # print("new gain", list(model.parameters())[2][0:10])
+            # print("new lnbias", list(model.parameters())[3][0:10])
+            #
+            # if batch_index == 1:
+            #     quit()
 
         test_model(model)
         # quit()
