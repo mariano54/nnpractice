@@ -8,20 +8,20 @@ def bpe_train(dataset: str, num_merges: int) -> Dict[int, str]:
     pass
 
 
-def read_corpus(filename: str) -> Dict[int, str]:
-    with open(filename, "r", encoding="utf-8") as f:
-        data = f.read().encode("utf-8")
+# def read_corpus(filename: str) -> Dict[int, str]:
+#     with open(filename, "r", encoding="utf-8") as f:
+#         data = f.read().encode("utf-8")
+#
 
-
-read_corpus("../data/taylor_swift_wiki.txt")
+# read_corpus("./data/taylor_swift_wiki.txt")
 
 encoding_map: Dict[str, int] = {}
 
-with open("../weights/gpt2_encoder.json", "rb") as f:
+with open("weights/gpt2_encoder.json", "rb") as f:
     for k, v in json.loads(f.read()).items():
         encoding_map[k] = v
 
-with open("../weights/gpt2_vocab.bpe", "rb") as f:
+with open("weights/gpt2_vocab.bpe", "rb") as f:
     merges: Dict[Tuple[str, str], int] = {tuple(l[:-1].decode("utf-8").split(' ')): i + 256 for i, l in
                                           enumerate(f.readlines()[1:])}
 
@@ -61,10 +61,14 @@ class GPT2Tokenizer:
         pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
         gpt2_regex = regex.compile(pat_str)
         final_list: List[str] = []
+        out_count = 0
+        in_count = 0
         for sub_string in gpt2_regex.findall(str_to_encode):
+            in_count += 1
             current_str: List[str] = [self.byte_encoding[b] for b in sub_string.encode("utf-8")]
             not_found_strs: Set[Tuple[str, str]] = set()
             while True:
+                in_count += 1
                 stats = get_stats(current_str)
                 large_number = 999999999
                 merge_options = [(self.merges.get((pair[0], pair[1]), large_number), pair)
@@ -89,6 +93,7 @@ class GPT2Tokenizer:
                 if len(current_str) == len(new_str):
                     not_found_strs.add(pair)
                 current_str = new_str
+        print(f"Out {out_count} in {in_count}")
         return [encoding_map[w] for w in final_list]
 
     def decode(self, encoded: List[int]) -> str:
@@ -96,10 +101,12 @@ class GPT2Tokenizer:
         decoded_utf8 = b"".join([bytes([self.byte_decoding[c]]) for c in unicode_str])
         return decoded_utf8.decode("utf-8")
 
+def _test():
+    gpt2_tokenizer = GPT2Tokenizer()
+    test_str = "hello world こんにちは, 今日は \n\n don't say but do... !"
+    result = gpt2_tokenizer.encode(test_str)
+    assert result == [31373, 995, 23294, 241, 22174, 28618, 2515, 94, 31676, 11, 220, 20015, 232, 33768, 98, 31676, 220,
+                      628, 836, 470, 910, 475, 466, 986, 5145]
+    assert(gpt2_tokenizer.decode(result) == test_str)
 
-gpt2_tokenizer = GPT2Tokenizer()
-test_str = "hello world こんにちは, 今日は \n\n don't say but do... !"
-result = gpt2_tokenizer.encode(test_str)
-assert result == [31373, 995, 23294, 241, 22174, 28618, 2515, 94, 31676, 11, 220, 20015, 232, 33768, 98, 31676, 220,
-                  628, 836, 470, 910, 475, 466, 986, 5145]
-assert(gpt2_tokenizer.decode(result) == test_str)
+# _test()

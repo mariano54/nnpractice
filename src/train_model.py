@@ -19,7 +19,7 @@ def train_model(
     torch.manual_seed(1338)
 
     initial_w = random_weights_nn(
-        len(dataset[0]),
+        dataset[0].shape,
         [(1000, True), (10, False)],
         device,
     )
@@ -46,12 +46,12 @@ def train_model(
     torch.manual_seed(2000)
     # print("original bn gain", modular_network.layers[1].bn_gain[:10])
     for pass_i in range(num_passes):
-        # if pass_i == 30000:
-        #     step_size = 0.01
-        # if pass_i == 70000:
-        #     step_size = 0.005
-        # if pass_i == 100000:
-        #     step_size = 0.001
+        if pass_i == 40000:
+            step_size = 0.01
+        if pass_i == 80000:
+            step_size = 0.005
+        if pass_i == 120000:
+            step_size = 0.001
 
         image_indexes = torch.randperm(len(dataset))[:batch_size]
         # image_indexes = torch.arange(32*pass_i, 32*(pass_i + 1))
@@ -79,25 +79,4 @@ def train_model(
             )
 
             test_model(modular_network, device_i=device)
-    return modular_network
-
-
-def main():
-    images, labels = load_data("train-images-idx3-ubyte", "train-labels-idx1-ubyte")
-
-    print("Initializing weights")
-
-    # with open("weights.pkl", "rb") as f:
-    #     initial_w = pickle.loads(f.read())
-    with torch.no_grad():
-        trained_model = train_model(images, labels)
-
-    # with open("../weights/weights.pkl", "wb") as f:
-    #     pickle.dump(initial_w, f)
-    # print("Wrote model to: weights.pkl")
-
-    test_model(trained_model, device)
-
-
-if __name__ == "__main__":
-    main()
+        return modular_network

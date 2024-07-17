@@ -3,13 +3,13 @@ from typing import List, Tuple, Optional
 import torch
 import math
 
-
-device = (
-    "cuda"
-    if torch.cuda.is_available()
-    else "mps" if torch.backends.mps.is_available() else "cpu"
-)
-print(f"Using {device} device")
+device = "cuda"
+# device = (
+#     "cuda"
+#     if torch.cuda.is_available()
+#     else "mps" if torch.backends.mps.is_available() else "cpu"
+# )
+# print(f"Using {device} device")
 
 
 @dataclasses.dataclass
@@ -29,7 +29,12 @@ class NNWeightsTorch:
 
 
 class ModularNetwork:
-    def __init__(self, weights: Optional[NNWeightsTorch], momentum: float):
+    def __init__(self, weights: Optional[NNWeightsTorch], momentum: float, B: int, T: int, C: int, vocab_size: int):
+        self.max_B = B
+        self.max_T = T
+        self.C = C
+        self.vocab_size = vocab_size
+        assert weights is None  # TODO: remove
         if weights is not None:
             self.layers = [
                 Linear(
@@ -43,25 +48,58 @@ class ModularNetwork:
                 Linear(weights.layers[1].weights, weights.layers[1].biases),
             ]
         else:
+            std = 1 / math.sqrt(C)
+            self.token_embeddings = torch.normal(0, std, (vocab_size, C)) # TODO: mean and stddev?
+            self.positional_embeddings = torch.normal(0, std, (vocab_size, C))
+
             self.layers = [
                 Linear(None, None, False, 784, 1000),
                 LayerNorm(None, None, 1000),
-                Relu(),
+                Gelu(),
                 Dropout(0.5),
-                # Linear(None, None, True, 1000, 50),
-                # BatchNorm(None, None, momentum, 50),
-                # Relu(),
-                Linear(None, None, True, 1000, 10, zero_biases=True),
+                Linear(None, None, True,    1000, 10, zero_biases=True),
             ]
         self.final_softmax = Softmax()
 
-    def forward(self, xs: torch.Tensor, training: bool = True) -> torch.Tensor:
-        intermediate_output: torch.Tensor = xs
-        for layer in self.layers:
-            intermediate_output = layer.forward(intermediate_output, training)
+    def forward(self, xs: torch.Tensor, ys: Optional[torch.Tensor]) -> torch.Tensor:
+        # xs and ys are shape (B,T)
+        assert xs.shape[0] <= self.max_B
+        assert xs.shape[1] <= self.max_T
 
-        self.final_softmax.forward(intermediate_output, training)
-        return self.final_softmax.probs
+        embeddings = self.token_embeddings[xs]  # Should result in B,T,C vector
+        position_emb = self.positional_embeddings[xs]
+
+        start = embeddings + position_emb
+        B, T, C = start.shape
+
+        end = start.view((B*T), C)  # B*T training examples
+        logits = end @ self.token_embeddings.T
+
+        self.final_softmax.forward(logits, ys is not None)
+        if ys is not None:
+            loss = -torch.mean(
+                torch.log(
+                    self.final_softmax.probs[
+                        range(self.final_softmax.probs.shape[0]), ys.view((B*T))
+                    ]
+                )
+            )
+            print("Loss", loss)
+        return self.final_softmax.probs.view((B, T, self.vocab_size))[:, -1]
+
+    def generate(self, xs: torch.Tensor, n_tokens: int):
+        B = xs.shape[0] # batch size
+        initial_len = xs.shape[1]
+        assert B <= self.max_B
+        while xs.shape[1] < initial_len + n_tokens:
+            last_word_probs = self.forward(xs[:, -self.max_T:], None)
+            last_gen_token: List[int] = []
+            for batch_index in range(B):
+                one_stream_probs = last_word_probs[batch_index]
+                sampled_token = torch.multinomial(one_stream_probs, num_samples=1)
+                last_gen_token.append(sampled_token.item())
+            xs = torch.cat((xs, torch.tensor(last_gen_token).unsqueeze(1)), dim=1)
+        return xs
 
     def backward(self, labels: torch.Tensor) -> None:
         assert self.final_softmax.probs is not None
@@ -112,7 +150,7 @@ class Gelu:
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         self.last_x = x
-        self.last_phi = math.tanh(math.sqrt(2 / math.pi) * (x + 0.0044715 * x**3))
+        self.last_phi = torch.tanh(math.sqrt(2 / math.pi) * (x + 0.0044715 * x**3))
         return 0.5 * x * (1 + self.last_phi)
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
@@ -374,6 +412,16 @@ class Dropout:
         return dx
 
     def apply_gradient(self, learning_rate: float):
+        pass
+class Attention:
+    def __init__(self):
+        pass
+
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, training: bool):
+        # X is B x T x C tensor
+        pass
+
+    def backward(self, doutput: torch.Tensor):
         pass
 
 def random_weights_nn(
