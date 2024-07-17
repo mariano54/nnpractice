@@ -29,7 +29,18 @@ class NNWeightsTorch:
 
 
 class ModularNetwork:
-    def __init__(self, weights: Optional[NNWeightsTorch], momentum: float, B: int, T: int, C: int, vocab_size: int):
+    def __init__(
+        self,
+        weights: Optional[NNWeightsTorch],
+        momentum: float,
+        B: int,
+        T: int,
+        C: int,
+        vocab_size: int,
+        n_heads: int,
+        dropout: float,
+        n_layers: int,
+    ):
         self.max_B = B
         self.max_T = T
         self.C = C
@@ -42,23 +53,24 @@ class ModularNetwork:
                     weights.layers[0].biases,
                     compute_dx=False,
                 ),
-                LayerNorm(weights.layers[0].batch_norm[0], weights.layers[0].batch_norm[1]),
+                LayerNorm(
+                    weights.layers[0].batch_norm[0], weights.layers[0].batch_norm[1]
+                ),
                 Relu(),
                 Dropout(0.5),
                 Linear(weights.layers[1].weights, weights.layers[1].biases),
             ]
         else:
             std = 1 / math.sqrt(C)
-            self.token_embeddings = torch.normal(0, std, (vocab_size, C)) # TODO: mean and stddev?
-            self.positional_embeddings = torch.normal(0, std, (vocab_size, C))
-
-            self.layers = [
-                Linear(None, None, False, 784, 1000),
-                LayerNorm(None, None, 1000),
-                Gelu(),
-                Dropout(0.5),
-                Linear(None, None, True,    1000, 10, zero_biases=True),
+            self.token_embeddings = torch.normal(0, std, (vocab_size, C)).to(device)
+            self.positional_embeddings = torch.normal(0, std, (T, C)).to(device)
+            self.initial_dropout = Dropout(dropout)
+            self.transformer_blocks = [
+                TransformerBlock(n_embed=C, n_heads=n_heads, dropout=dropout)
+                for _ in range(n_layers)
             ]
+            self.final_ln = LayerNorm(None, None, C)
+
         self.final_softmax = Softmax()
 
     def forward(self, xs: torch.Tensor, ys: Optional[torch.Tensor]) -> torch.Tensor:
@@ -66,21 +78,29 @@ class ModularNetwork:
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
 
+        # TODO: enable inputs of different sizes within batch
+
         embeddings = self.token_embeddings[xs]  # Should result in B,T,C vector
-        position_emb = self.positional_embeddings[xs]
+        position_emb = self.positional_embeddings[torch.arange(0, xs.shape[1])]
 
         start = embeddings + position_emb
         B, T, C = start.shape
 
-        end = start.view((B*T), C)  # B*T training examples
-        logits = end @ self.token_embeddings.T
+        filtered_start = self.initial_dropout.forward(start, True)
+        inter = filtered_start
+        for block in self.transformer_blocks:
+            inter = block.forward(inter, True)
+        inter = self.final_ln.forward(inter, True)
+
+        inter = inter.view((B * T), C)  # B*T training examples
+        logits = inter @ self.token_embeddings.T
 
         self.final_softmax.forward(logits, ys is not None)
         if ys is not None:
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
-                        range(self.final_softmax.probs.shape[0]), ys.view((B*T))
+                        range(self.final_softmax.probs.shape[0]), ys.view((B * T))
                     ]
                 )
             )
@@ -88,11 +108,11 @@ class ModularNetwork:
         return self.final_softmax.probs.view((B, T, self.vocab_size))[:, -1]
 
     def generate(self, xs: torch.Tensor, n_tokens: int):
-        B = xs.shape[0] # batch size
+        B = xs.shape[0]  # batch size
         initial_len = xs.shape[1]
         assert B <= self.max_B
         while xs.shape[1] < initial_len + n_tokens:
-            last_word_probs = self.forward(xs[:, -self.max_T:], None)
+            last_word_probs = self.forward(xs[:, -self.max_T :], None)
             last_gen_token: List[int] = []
             for batch_index in range(B):
                 one_stream_probs = last_word_probs[batch_index]
@@ -198,6 +218,7 @@ class Linear:
         input_dim: Optional[int] = None,
         output_dim: Optional[int] = None,
         zero_biases: bool = False,
+        residual_scaling_num_layers: Optional[int] = None,
     ):
         assert (weights is not None) == (bias is not None)
         if weights is not None:
@@ -205,6 +226,9 @@ class Linear:
             self.bias = bias
         else:
             std_dev = math.sqrt(2) / math.sqrt(output_dim)
+            if residual_scaling_num_layers is not None:
+                std_dev /= 2 * math.sqrt(residual_scaling_num_layers)
+
             self.weights = (
                 torch.normal(mean=0, std=std_dev, size=(output_dim, input_dim))
                 .float()
@@ -263,14 +287,18 @@ class LayerNorm:
         z: torch.Tensor,
         training: bool,
     ) -> torch.Tensor:
-        bn_mean = (1.0 / z.shape[1]) * (z.sum(1, keepdim=True)) # 32x1
-        self.bn_diff = z - bn_mean # 32x1000
-        self.bn_diff_sq = self.bn_diff**2 # 32x1000
-        self.bn_var = (1.0 / (z.shape[1])) * self.bn_diff_sq.sum(1, keepdim=True) #32x1
+        bn_mean = (1.0 / z.shape[1]) * (z.sum(1, keepdim=True))  # 32x1
+        self.bn_diff = z - bn_mean  # 32x1000
+        self.bn_diff_sq = self.bn_diff**2  # 32x1000
+        self.bn_var = (1.0 / (z.shape[1])) * self.bn_diff_sq.sum(
+            1, keepdim=True
+        )  # 32x1
 
-        self.bn_var_inv = (self.bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
-        self.x_hat = self.bn_diff * self.bn_var_inv #32x1000
-        preact = self.x_hat * self.bn_gain + self.bn_bias #32x1000
+        self.bn_var_inv = (
+            self.bn_var + 1e-5
+        ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+        self.x_hat = self.bn_diff * self.bn_var_inv  # 32x1000
+        preact = self.x_hat * self.bn_gain + self.bn_bias  # 32x1000
         return preact
 
     def backward(self, doutput: torch.Tensor):
@@ -284,9 +312,9 @@ class LayerNorm:
         d_bnvarinvdL = (self.bn_diff * d_xhatdL).sum(1, keepdim=True)
         d_bnvardL = (-0.5 * (self.bn_var + 1e-5) ** (-1.5)) * d_bnvarinvdL
         d_bndiffsqrdL = (1.0 / (layer_size)) * d_bnvardL.expand(n, layer_size)
-        d_bndiffdL = self.bn_var_inv *d_xhatdL + (2 * self.bn_diff) * d_bndiffsqrdL
+        d_bndiffdL = self.bn_var_inv * d_xhatdL + (2 * self.bn_diff) * d_bndiffsqrdL
         d_bn_meandL = (-1 * d_bndiffdL).sum(1, keepdim=True)
-        d_z = d_bndiffdL + (1/layer_size)*d_bn_meandL.expand(n, layer_size)
+        d_z = d_bndiffdL + (1 / layer_size) * d_bn_meandL.expand(n, layer_size)
 
         self.d_gain = (self.x_hat * d_preact).sum(0, keepdim=True)
         self.d_bias = d_preact.sum(0, keepdim=True)
@@ -393,6 +421,7 @@ class BatchNorm:
         self.bn_gain -= learning_rate * self.d_gain
         self.bn_bias -= learning_rate * self.d_bias
 
+
 class Dropout:
     def __init__(self, dropout_prob: float):
         self.dropout_prob = dropout_prob
@@ -401,7 +430,7 @@ class Dropout:
     def forward(self, x: torch.Tensor, training: bool):
         if not training:
             return x
-        prob_tensor = torch.full(x.shape, 1-self.dropout_prob).to(device)
+        prob_tensor = torch.full(x.shape, 1 - self.dropout_prob).to(device)
         self.dropout_tensor = torch.bernoulli(prob_tensor).to(device)
         result = self.dropout_tensor * (1 / (1 - self.dropout_prob)) * x
         return result
@@ -413,16 +442,55 @@ class Dropout:
 
     def apply_gradient(self, learning_rate: float):
         pass
+
+
 class Attention:
-    def __init__(self):
+    def __init__(self, n_embed: int, n_heads: int):
         pass
 
     def forward(self, x: torch.Tensor, mask: torch.Tensor, training: bool):
         # X is B x T x C tensor
-        pass
+        return x
 
     def backward(self, doutput: torch.Tensor):
         pass
+
+
+class TransformerBlock:
+    def __init__(self, n_embed: int, n_heads: int, dropout: float):
+        # TODO: configure
+
+        self.attention_section = [
+            LayerNorm(None, None, n_embed),
+            Attention(n_embed, n_heads),
+            Dropout(dropout),
+        ]
+
+        self.MLP_section = [
+            LayerNorm(None, None, n_embed),
+            Linear(None, None, True, n_embed, n_embed * 4, True),
+            Gelu(),
+            Linear(None, None, True, n_embed * 4, n_embed, True),
+            Dropout(dropout),
+        ]
+
+    def forward(self, x: torch.Tensor, training: bool):
+        inter: torch.Tensor = x.clone()  # Intermediate output
+        for layer in self.attention_section:
+            inter = layer.forward(inter, training)
+
+        # TODO: consider residual scaling
+        inter = inter + x
+
+        for layer in self.MLP_section:
+            inter = layer.forward(inter, training)
+        inter = inter + x
+        return inter
+
+    def backward(self, doutput: torch.Tensor):
+        # TODO: write
+        return doutput
+
 
 def random_weights_nn(
     data_size: int,

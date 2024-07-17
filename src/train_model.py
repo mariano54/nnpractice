@@ -5,7 +5,8 @@ import pickle
 from src.load_data import load_data
 from src.neural_net import (
     ModularNetwork,
-    device, random_weights_nn,
+    device,
+    random_weights_nn,
 )
 from test.test_MNIST_performance import test_model
 
@@ -15,8 +16,8 @@ def train_model(
     labels: List[int],
     momentum=0.1,
     num_passes=400000,
+    seed: int = 1338,
 ) -> ModularNetwork:
-    torch.manual_seed(1338)
 
     initial_w = random_weights_nn(
         dataset[0].shape,
@@ -43,7 +44,6 @@ def train_model(
     batch_size: int = 32
     step_size = 0.1
 
-    torch.manual_seed(2000)
     # print("original bn gain", modular_network.layers[1].bn_gain[:10])
     for pass_i in range(num_passes):
         if pass_i == 40000:
