@@ -4,7 +4,7 @@ import pickle
 
 from src.load_data import load_data
 from src.neural_net import (
-    ModularNetwork,
+    GPT2Model,
     device,
     random_weights_nn,
 )
@@ -17,7 +17,7 @@ def train_model(
     momentum=0.1,
     num_passes=400000,
     seed: int = 1338,
-) -> ModularNetwork:
+) -> GPT2Model:
 
     initial_w = random_weights_nn(
         dataset[0].shape,
@@ -39,7 +39,7 @@ def train_model(
     # initial_w.layers[1].weights.requires_grad = True
     # initial_w.layers[1].biases.requires_grad = True
     # print(initial_w.layers[0].batch)
-    modular_network = ModularNetwork(None, momentum)
+    modular_network = GPT2Model(None, momentum)
     labels_pytorch = torch.as_tensor(labels).to(device)
     batch_size: int = 32
     step_size = 0.1

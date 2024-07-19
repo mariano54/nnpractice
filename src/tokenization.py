@@ -93,13 +93,12 @@ class GPT2Tokenizer:
                 if len(current_str) == len(new_str):
                     not_found_strs.add(pair)
                 current_str = new_str
-        print(f"Out {out_count} in {in_count}")
         return [encoding_map[w] for w in final_list]
 
     def decode(self, encoded: List[int]) -> str:
         unicode_str = "".join(self.decoding_map[i] for i in encoded)
         decoded_utf8 = b"".join([bytes([self.byte_decoding[c]]) for c in unicode_str])
-        return decoded_utf8.decode("utf-8")
+        return decoded_utf8.decode("utf-8", errors="replace")
 
 def _test():
     gpt2_tokenizer = GPT2Tokenizer()
