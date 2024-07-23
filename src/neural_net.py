@@ -18,18 +18,20 @@ print(f"Using {device} device")
 
 class GPT2Model:
     def __init__(
-        self,
-        weights: Optional[GPT2Weights],
-        B: int,
-        T: int,
-        C: int,
-        vocab_size: int,
-        n_heads: int,
-        dropout: float,
+            self,
+            weights: Optional[GPT2Weights],
+            B: int,
+            T: int,
+            C: int,
+            vocab_size: int,
+            n_heads: int,
+            dropout: float,
     ):
         self.max_B = B
         self.max_T = T
         self.C = C
+        self.B = None
+        self.T = None
         self.vocab_size = vocab_size
         n_layers = len(weights.transformer)
         assert int(C / n_heads) == C / n_heads
@@ -49,14 +51,17 @@ class GPT2Model:
             self.token_embeddings = weights.wte
             self.positional_embeddings = weights.wpe
             self.transformer_blocks = [
-                TransformerBlock(n_embed=C, n_heads=n_heads, dropout=dropout, transformer_weights=weights.transformer[i])
+                TransformerBlock(n_embed=C, n_heads=n_heads, dropout=dropout,
+                                 transformer_weights=weights.transformer[i])
                 for i in range(n_layers)
             ]
             self.final_ln = LayerNorm(weights.transformer_ln_f_weight, weights.transformer_ln_f_bias, None)
+            self.pre_lm_head = None
             self.lm_head = weights.wte
+
         self.final_softmax = Softmax()
 
-    def forward(self, xs: torch.Tensor, ys: Optional[torch.Tensor]) -> torch.Tensor:
+    def forward(self, xs: torch.Tensor, ys: Optional[torch.Tensor], topk: Optional[int]=None, temperature: float=1) -> torch.Tensor:
         # xs and ys are shape (B,T)
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
@@ -67,39 +72,41 @@ class GPT2Model:
         position_emb = self.positional_embeddings[torch.arange(0, xs.shape[1]).to(device)]
 
         start = embeddings + position_emb
-        print(f"Start shape: {start.shape}")
-        print("Start[0][0][:5]", start[0][0][:5])
-        B, T, C = start.shape
+        self.B, self.T, C = start.shape
 
         filtered_start = self.initial_dropout.forward(start, True)
         inter = filtered_start
         for block in self.transformer_blocks:
             inter = block.forward(inter, True)
-            print(f"First block: {inter.shape} {inter[0][0][:5]}")
-            quit()
         inter = self.final_ln.forward(inter, True)
 
-        inter = inter.view((B * T), C)  # B*T training examples
-        logits = inter @ self.lm_head.T
-
-        self.final_softmax.forward(logits, ys is not None)
         if ys is not None:
+            self.pre_lm_head = inter.view((self.B * self.T), C)  # B*T training examples
+            logits = self.pre_lm_head @ self.lm_head.T
+            self.final_softmax.forward(logits, ys is not None)
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
-                        range(self.final_softmax.probs.shape[0]), ys.view((B * T))
+                        range(self.final_softmax.probs.shape[0]), ys.view((self.B * self.T))
                     ]
                 )
             )
-            print("Loss", loss)
-        return self.final_softmax.probs.view((B, T, self.vocab_size))[:, -1]
+            print(f"Loss: {loss}")
+            return self.final_softmax.probs.view((self.B, self.T, self.vocab_size))
+        else:
+            assert topk is not None
+            logits = (inter[:, -1, :] @ self.lm_head.T) / temperature
+            vals, _ = torch.topk(logits, topk, 1)
+            logits[logits < vals[:, [-1]]] = float("-inf")
+            self.final_softmax.forward(logits, ys is not None)
+            return self.final_softmax.probs
 
-    def generate(self, xs: torch.Tensor, n_tokens: int):
+    def generate(self, xs: torch.Tensor, n_tokens: int, topk: int, temperature: float = 1.0):
         B = xs.shape[0]  # batch size
         initial_len = xs.shape[1]
         assert B <= self.max_B
         while xs.shape[1] < initial_len + n_tokens:
-            last_word_probs = self.forward(xs[:, -self.max_T :], None)
+            last_word_probs = self.forward(xs[:, -self.max_T:], None, topk, temperature)
             last_gen_token: List[int] = []
             for batch_index in range(B):
                 one_stream_probs = last_word_probs[batch_index]
@@ -110,17 +117,20 @@ class GPT2Model:
 
     def backward(self, labels: torch.Tensor) -> None:
         assert self.final_softmax.probs is not None
-        loss = -torch.mean(
-            torch.log(
-                self.final_softmax.probs[
-                    range(self.final_softmax.probs.shape[0]), labels
-                ]
-            )
-        )
-        # loss.backward()
-        doutput = self.final_softmax.backward_cross_entropy(labels)
-        for layer in reversed(self.layers):
-            doutput = layer.backward(doutput)
+        dlogits = self.final_softmax.backward_cross_entropy(labels)
+
+        dpre_lm_head = self.lm_head * dlogits
+        dlm_head_w = self.pre_lm_head * dlogits
+
+        doutput = dpre_lm_head.view(self.B, self.T, self.C)
+        doutput = self.final_ln.backward(doutput)
+
+        for block in reversed(self.transformer_blocks):
+            doutput = block.backward(doutput)
+
+        doutput = self.initial_dropout.backward(doutput)
+
+
 
     def apply_gradient(self, learning_rate: float) -> None:
         for layer in reversed(self.layers):
@@ -152,21 +162,24 @@ class Relu:
 class Gelu:
     def __init__(self):
         self.last_x = None
-        self.last_phi = None
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         self.last_x = x
-        self.last_phi = torch.tanh(math.sqrt(2 / math.pi) * (x + 0.0044715 * x**3))
-        return 0.5 * x * (1 + self.last_phi)
+        last_phi_plus_1 = 1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x ** 3))
+        last_phi_plus_1 *= (0.5 * x)
+        # del last_phi_plus_1
+        # torch.cuda.empty_cache()
+        return last_phi_plus_1
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
+        last_phi = torch.tanh(math.sqrt(2 / math.pi) * (self.last_x + 0.044715 * self.last_x ** 3))
         dgelu = 0.5 * (
-            1
-            + self.last_phi
-            + self.last_x
-            * math.sqrt(2 / math.pi)
-            * (1 + 0.13145 * self.last_x**2)
-            * (1 - self.last_phi**2)
+                1
+                + last_phi
+                + self.last_x
+                * math.sqrt(2 / math.pi)
+                * (1 + 0.13145 * self.last_x ** 2)
+                * (1 - self.last_phi ** 2)
         )
         return dgelu * doutput
 
@@ -175,17 +188,19 @@ class Gelu:
 
 
 class Softmax:
-    def __init__(self, dimension: int=1):
+    def __init__(self, dimension: int = 1):
         self.probs = None
         self.dimension = dimension
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
         x = x - torch.max(x, dim=self.dimension, keepdim=True).values
-        exps = torch.exp(x)
-        denominators = torch.sum(exps, dim=self.dimension, keepdim=True)
-        probs = (exps / denominators)
-        self.probs = probs
-        return probs
+        # exps = torch.exp(x)
+        x.exp_()
+        denominators = torch.sum(x, dim=self.dimension, keepdim=True)
+
+        # probs = (x / denominators)
+        self.probs = x.div_(denominators)
+        return self.probs
 
     def backward_cross_entropy(self, labels: torch.Tensor) -> torch.Tensor:
         n = self.probs.shape[0]
@@ -193,20 +208,23 @@ class Softmax:
         d_logits[range(n), labels] -= 1
         return d_logits / n
 
+    def backward(self, labels: torch.Tensor) -> torch.Tensor:
+        pass
+
     def apply_gradient(self, learning_rate: float):
         pass
 
 
 class Linear:
     def __init__(
-        self,
-        weights: Optional[torch.Tensor],
-        bias: Optional[torch.Tensor],
-        compute_dx: bool = True,
-        input_dim: Optional[int] = None,
-        output_dim: Optional[int] = None,
-        zero_biases: bool = False,
-        residual_scaling_num_layers: Optional[int] = None,
+            self,
+            weights: Optional[torch.Tensor],
+            bias: Optional[torch.Tensor],
+            compute_dx: bool = True,
+            input_dim: Optional[int] = None,
+            output_dim: Optional[int] = None,
+            zero_biases: bool = False,
+            residual_scaling_num_layers: Optional[int] = None,
     ):
         assert (weights is not None) == (bias is not None)
         if weights is not None:
@@ -220,7 +238,7 @@ class Linear:
         self.compute_dx = compute_dx
 
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
-        self.last_inputs = xs
+        self.last_inputs = xs.clone()
         ret = xs @ self.weights + self.bias
         return ret
 
@@ -238,10 +256,10 @@ class Linear:
 
 class LayerNorm:
     def __init__(
-        self,
-        bn_gain: Optional[torch.Tensor],
-        bn_bias: Optional[torch.Tensor],
-        layer_size: Optional[int] = None,
+            self,
+            bn_gain: Optional[torch.Tensor],
+            bn_bias: Optional[torch.Tensor],
+            layer_size: Optional[int] = None,
     ):
         assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
         if bn_bias is not None:
@@ -249,42 +267,44 @@ class LayerNorm:
             self.bn_bias = bn_bias
         else:
             self.bn_gain, self.bn_bias = layer_batch_norm_rw(layer_size, device)
-        self.bn_var_inv = None  # Used in backprop
         self.x_hat = None  # Used in backprop
         self.d_bias = None
         self.d_gain = None
 
     def forward(
-        self,
-        z: torch.Tensor,
-        training: bool,
+            self,
+            z: torch.Tensor,
+            training: bool,
     ) -> torch.Tensor:
         bn_mean = (1.0 / z.shape[2]) * (z.sum(2, keepdim=True))  # 32x1
-        self.bn_diff = z - bn_mean  # 32x1000
-        self.bn_diff_sq = self.bn_diff**2  # 32x1000
-        self.bn_var = (1.0 / (z.shape[2])) * self.bn_diff_sq.sum(
+        self.bn_diff = z - bn_mean  # B*T*C
+        bn_diff_sq = self.bn_diff ** 2  # B*T*C
+        self.bn_var = (1.0 / (z.shape[2])) * bn_diff_sq.sum(
             2, keepdim=True
         )  # 32x1
 
-        self.bn_var_inv = (
-            self.bn_var + 1e-5
-        ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
-        self.x_hat = self.bn_diff * self.bn_var_inv  # 32x1000
+        bn_var_inv = (
+                             self.bn_var + 1e-5
+                     ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+        self.x_hat = self.bn_diff * bn_var_inv  # 32x1000
         preact = self.x_hat * self.bn_gain + self.bn_bias  # 32x1000
         return preact
 
     def backward(self, doutput: torch.Tensor):
         d_preact: torch.Tensor = doutput
-        assert self.bn_var_inv is not None
         assert self.x_hat is not None
         n = doutput.shape[0]
         layer_size = doutput.shape[1]
 
+        bn_var_inv = (
+                             self.bn_var + 1e-5
+                     ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+
         d_xhatdL = self.bn_gain * d_preact
         d_bnvarinvdL = (self.bn_diff * d_xhatdL).sum(1, keepdim=True)
         d_bnvardL = (-0.5 * (self.bn_var + 1e-5) ** (-1.5)) * d_bnvarinvdL
-        d_bndiffsqrdL = (1.0 / (layer_size)) * d_bnvardL.expand(n, layer_size)
-        d_bndiffdL = self.bn_var_inv * d_xhatdL + (2 * self.bn_diff) * d_bndiffsqrdL
+        d_bndiffsqrdL = (1.0 / layer_size) * d_bnvardL.expand(n, layer_size)
+        d_bndiffdL = bn_var_inv * d_xhatdL + (2 * self.bn_diff) * d_bndiffsqrdL
         d_bn_meandL = (-1 * d_bndiffdL).sum(1, keepdim=True)
         d_z = d_bndiffdL + (1 / layer_size) * d_bn_meandL.expand(n, layer_size)
 
@@ -314,11 +334,11 @@ class LayerNorm:
 
 class BatchNorm:
     def __init__(
-        self,
-        bn_gain: Optional[torch.Tensor],
-        bn_bias: Optional[torch.Tensor],
-        momentum: float,
-        layer_size: Optional[int] = None,
+            self,
+            bn_gain: Optional[torch.Tensor],
+            bn_bias: Optional[torch.Tensor],
+            momentum: float,
+            layer_size: Optional[int] = None,
     ):
         assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
         self.momentum = momentum
@@ -335,14 +355,14 @@ class BatchNorm:
         self.d_gain = None
 
     def forward(
-        self,
-        z: torch.Tensor,
-        training: bool,
+            self,
+            z: torch.Tensor,
+            training: bool,
     ) -> torch.Tensor:
         if training:
             bn_mean = (1.0 / z.shape[0]) * (z.sum(0, keepdim=True))
             bn_diff = z - bn_mean
-            bn_diff_sq = bn_diff**2
+            bn_diff_sq = bn_diff ** 2
             bn_var = (1.0 / (z.shape[0])) * bn_diff_sq.sum(0, keepdim=True)
 
         else:
@@ -358,10 +378,10 @@ class BatchNorm:
 
         if training:
             self.running_mean = (1 - self.momentum) * self.running_mean + (
-                self.momentum * bn_mean
+                    self.momentum * bn_mean
             )
             self.running_var = (1 - self.momentum) * self.running_var + (
-                self.momentum * bn_var
+                    self.momentum * bn_var
             )
 
         return preact
@@ -374,15 +394,15 @@ class BatchNorm:
         # The following is taken from
         # github.com/karpathy/nn-zero-to-hero/blob/master/lectures/makemore/makemore_part4_backprop.ipyn
         dz = (
-            self.bn_gain
-            * self.bn_var_inv
-            / n
-            * (
-                n * d_preact
-                - d_preact.sum(0)
-                # - n / (n - 1) * To align with pytorch, keep this commented
-                - self.x_hat * (d_preact * self.x_hat).sum(0)
-            )
+                self.bn_gain
+                * self.bn_var_inv
+                / n
+                * (
+                        n * d_preact
+                        - d_preact.sum(0)
+                        # - n / (n - 1) * To align with pytorch, keep this commented
+                        - self.x_hat * (d_preact * self.x_hat).sum(0)
+                )
         )
         self.d_gain = (self.x_hat * d_preact).sum(0, keepdim=True)
         self.d_bias = d_preact.sum(0, keepdim=True)
@@ -421,7 +441,7 @@ class Attention:
     def __init__(self, n_embed: int, n_heads: int, dropout: float, ws: Optional[AttentionWeights]):
         self.n_embed = n_embed
         self.n_heads = n_heads
-        self.inv_sqrt_head_size = 1.0/math.sqrt(self.n_embed/self.n_heads)
+        self.inv_sqrt_head_size = 1.0 / math.sqrt(self.n_embed / self.n_heads)
         self.key_matrix = 2
         # TODO: check the magnitude of these values
         if ws is not None:
@@ -440,39 +460,32 @@ class Attention:
         self.softmax = Softmax(dimension=3)  # Sum over the keys dimension (last dimension in masked)
 
     def split_heads(self, qk: torch.Tensor) -> torch.Tensor:
-        return qk.view(qk.shape[0], qk.shape[1], self.n_heads, int(self.n_embed/self.n_heads)).transpose(-3,-2)
-
+        return qk.view(qk.shape[0], qk.shape[1], self.n_heads, int(self.n_embed / self.n_heads)).transpose(-3, -2)
 
     def forward(self, x: torch.Tensor, training: bool):
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
-        print(f"Qw qb shapes: {self.q_map.weights.shape} {self.q_map.bias.shape}")
-        print(f"QW: {self.q_map.weights[0][:5]}")
-        print(f"QW 100 last 5: {self.q_map.weights[100][-5:]}")
-        print(f"QB: {self.q_map.bias[:5]}")
-        pickle.dump(self.q_map.weights, open("testingq.pkl", "wb"))
-        pickle.dump(x, open("testingx.pkl", "wb"))
-        just_qmap = x @ self.q_map.weights
-        print(f"Just Qmap: {just_qmap.shape} {just_qmap[0][0][:5]}")
+
         q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
-        k = self.split_heads(self.k_map.forward(x, training))  # B,nh,T,hs
+        k = self.split_heads(self.k_map.forward(x, training)).transpose(-2, -1)  # B,nh,hs,T
         v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        print(q.dtype)
-        print(f"Q: {q.shape} {q[0][0][0][:5]}")
-
-        dot_prods = (q @ k.transpose(-2, -1)) * self.inv_sqrt_head_size
-
+        dot_prods = (q @ k) * self.inv_sqrt_head_size
+        del q, k
         mask = torch.ones_like(dot_prods).tril()
-        masked = dot_prods.masked_fill(mask == 0, float("-inf"))  # B,nh,T,T matrix
+        dot_prods.masked_fill_(mask == 0, float("-inf"))
+        del mask
 
-        weights = self.softmax.forward(masked, training)
-        filtered_weights = self.dropout.forward(weights, training)
+        attention = self.softmax.forward(dot_prods, training)
+        attention = self.dropout.forward(attention, training)
+        attention = attention @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
+        attention = attention.transpose(1, 2).contiguous().view(attention.shape[0], attention.shape[2],
+                                                                self.n_embed)  # B,T,C
 
-        value_deltas = torch.einsum("bnct,bnth->bnth", filtered_weights, v) # B,nh,T,hs
-        stacked_values = value_deltas.transpose(1,2).contiguous().view(value_deltas.shape[0], value_deltas.shape[2], self.n_embed) # B,T,C
-
-        deltas = self.proj_map.forward(stacked_values, training) # Still BTC, but now with the correct values
+        deltas = self.proj_map.forward(attention, training)  # Still BTC, but now with the correct values
+        del dot_prods, attention
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         return deltas
 
@@ -503,32 +516,29 @@ class TransformerBlock:
             ]
             self.MLP_section = [
                 LayerNorm(transformer_weights.ln_2_weight, transformer_weights.ln_2_bias, None),
-                Linear(transformer_weights.mlp.fc_weight, transformer_weights.mlp.fc_bias, True, n_embed, n_embed * 4, False),
+                Linear(transformer_weights.mlp.fc_weight, transformer_weights.mlp.fc_bias, True, n_embed, n_embed * 4,
+                       False),
                 Gelu(),
-                Linear(transformer_weights.mlp.proj_weight, transformer_weights.mlp.proj_bias, True, n_embed * 4, n_embed, False),
+                Linear(transformer_weights.mlp.proj_weight, transformer_weights.mlp.proj_bias, True, n_embed * 4,
+                       n_embed, False),
                 Dropout(dropout),
             ]
 
     def forward(self, x: torch.Tensor, training: bool):
         inter: torch.Tensor = x.clone()  # Intermediate output
-        print("X", inter[0][0][:5])
         for layer in self.attention_section:
             inter = layer.forward(inter, training)
-            if layer == self.attention_section[0]:
-                print(f"bn gain: {layer.bn_gain[:5]} {layer.bn_bias[:5]}")
-                print(f"Lnd: {inter[0][0][:5]}")
+            torch.cuda.empty_cache()
 
-        print("Inter0", inter[0][0][:5])
         # TODO: consider residual scaling
         inter = inter + x
-        print("Inter1", inter[0][0][:5])
         x = inter.clone()
 
         for layer in self.MLP_section:
             inter = layer.forward(inter, training)
+            torch.cuda.empty_cache()
 
         inter = inter + x
-        print("Inter2", inter[0][0][:5])
         return inter
 
     def backward(self, doutput: torch.Tensor):

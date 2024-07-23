@@ -2,7 +2,7 @@ from src.load_data import load_data
 import torch
 import pickle
 
-from src.neural_net import ModularNetwork
+from src.neural_net import GPT2Model
 
 
 def test_model_from_file(weights_filename: str, device_i: str):
@@ -12,7 +12,7 @@ def test_model_from_file(weights_filename: str, device_i: str):
     test_model(weights, device_i)
 
 
-def test_model(network: ModularNetwork, device_i: str):
+def test_model(network: GPT2Model, device_i: str):
     images, labels = load_data("t10k-images-idx3-ubyte", "t10k-labels-idx1-ubyte")
     failure = 0
     batch_size = 32
