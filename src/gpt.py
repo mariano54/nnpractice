@@ -7,26 +7,42 @@ from typing import List
 from src.gpt2_weights import GPT2Weights
 
 import torch
+
 device = "cuda"
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
-dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16'  # 'float32' or 'bfloat16' or 'float16'
-device_type = 'cuda' if 'cuda' in device else 'cpu'  # for later use in torch.autocast
-ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torch.float16}[dtype]
-ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+dtype = (
+    "bfloat16"
+    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+    else "float16"
+)  # 'float32' or 'bfloat16' or 'float16'
+device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
+ptdtype = {
+    "float32": torch.float32,
+    "bfloat16": torch.bfloat16,
+    "float16": torch.float16,
+}[dtype]
+ctx = (
+    nullcontext()
+    if device_type == "cpu"
+    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+)
 from src.tokenization import GPT2Tokenizer
+
 
 def get_batch(dataset: List[int], block_size: int, batch_size: int):
     xs = []
     ys = []
     for i in range(batch_size):
         index_start = torch.randint(0, len(dataset) - (block_size + 1), (1,))[0]
-        data_slice = torch.tensor(dataset[index_start: index_start + block_size + 1])
+        data_slice = torch.tensor(dataset[index_start : index_start + block_size + 1])
         xs.append(data_slice[:-1])
         ys.append(data_slice[1:])
     return torch.stack(xs).to(device), torch.stack(ys).to(device)
 
+
 from src.neural_net import GPT2Model, device
+
 
 def main():
 
@@ -46,7 +62,9 @@ def main():
 
         encoded_dataset = gpt2_tokenizer.encode(text)
         pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
-        decoded = gpt2_tokenizer.decode(encoded_dataset, )
+        decoded = gpt2_tokenizer.decode(
+            encoded_dataset,
+        )
         assert decoded == text
     if Path("data/gpt2_weights.pkl").is_file():
         weights: GPT2Weights = pickle.load(open("data/gpt2_weights.pkl", "rb"))
@@ -62,22 +80,35 @@ def main():
     dropout = 0.0
     topk = 200
     with ctx:
-        llm = GPT2Model(weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout)
+        llm = GPT2Model(
+            weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout
+        )
 
-        first_encoding = torch.tensor([gpt2_tokenizer.encode("I am very curious about"),
-                                       gpt2_tokenizer.encode("Why do you always complain")], dtype=torch.long).to(device)
+        first_encoding = torch.tensor(
+            [
+                gpt2_tokenizer.encode("I am very curious about"),
+                gpt2_tokenizer.encode("Why do you always complain"),
+            ],
+            dtype=torch.long,
+        ).to(device)
         new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
         results = []
         for i in range(new_tokens.shape[0]):
             results.append(gpt2_tokenizer.decode(new_tokens[i][:].tolist()))
-        assert results == ["I am very curious about the nature of the relationship",
-                           "Why do you always complain about the lack of quality"]
+        assert results == [
+            "I am very curious about the nature of the relationship",
+            "Why do you always complain about the lack of quality",
+        ]
 
         print("First test successful.")
 
         torch.manual_seed(100)
         xs, ys = get_batch(encoded_dataset, block_size, batch_size)
         all_probs = llm.forward(xs, ys)
+        llm.backward(ys)
+        llm.apply_gradient(0.001)
+
+        print(llm.dpos_embeddings[0][:5])
     #
     # print("generating predictions...")
     # xs, ys = get_batch(encoded_dataset, current_context, 2)
@@ -86,6 +117,7 @@ def main():
     #     print("First prediction: ")
     #     print(gpt2_tokenizer.decode(new_xs[i][current_context- 10:].tolist()))
     #
+
 
 if __name__ == "__main__":
     with torch.no_grad():
