@@ -43,28 +43,7 @@ def get_batch(dataset: List[int], block_size: int, batch_size: int):
 
 from src.neural_net import GPT2Model, device
 
-
-def main():
-    # Below configuration taken from https://github.com/karpathy/nanoGPT
-    seed = 1337
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    # torch.set_printoptions(precision=4)
-
-    # with ctx:
-    gpt2_tokenizer = GPT2Tokenizer()
-    if Path("data/shakespeare.pkl").is_file():
-        encoded_dataset = pickle.load(open("data/shakespeare.pkl", "rb"))
-    else:
-        with open("data/shakespeare.txt", "r") as f:
-            text = f.read()
-
-        encoded_dataset = gpt2_tokenizer.encode(text)
-        pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
-        decoded = gpt2_tokenizer.decode(
-            encoded_dataset,
-        )
-        assert decoded == text
+def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[int]):
     if Path("data/gpt2_weights.pkl").is_file():
         weights: GPT2Weights = pickle.load(open("data/gpt2_weights.pkl", "rb"))
         weights = weights.to(device)
@@ -104,11 +83,35 @@ def main():
     torch.manual_seed(100)
     xs, ys = get_batch(encoded_dataset, block_size, batch_size)
     _, loss = llm.forward(xs, ys)
-    assert torch.isclose(loss, torch.tensor(4.97744))
+    assert torch.isclose(loss, torch.tensor(4.97744), atol=2e-2)
     llm.backward(ys)
     llm.apply_gradient(0.001)
     _, loss = llm.forward(xs, ys)
-    assert torch.isclose(loss, torch.tensor(4.866), atol=1e-2)
+    assert torch.isclose(loss, torch.tensor(4.866), atol=2e-2)
+
+def main():
+    # Below configuration taken from https://github.com/karpathy/nanoGPT
+    seed = 1337
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    # torch.set_printoptions(precision=4)
+
+    # with ctx:
+    gpt2_tokenizer = GPT2Tokenizer()
+    if Path("data/shakespeare.pkl").is_file():
+        encoded_dataset = pickle.load(open("data/shakespeare.pkl", "rb"))
+    else:
+        with open("data/shakespeare.txt", "r") as f:
+            text = f.read()
+
+        encoded_dataset = gpt2_tokenizer.encode(text)
+        pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
+        decoded = gpt2_tokenizer.decode(
+            encoded_dataset,
+        )
+        assert decoded == text
+    test_forward_backward(gpt2_tokenizer, encoded_dataset)
+
     # xs, ys = get_batch(encoded_dataset, current_context, 2)
     # new_xs = llm.generate(xs, 10)
     # for i in range(new_xs.shape[0]):

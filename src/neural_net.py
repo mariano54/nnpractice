@@ -84,7 +84,7 @@ class GPT2Model:
         # xs and ys are shape (B,T)
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
-        self.xs = xs.clone()
+        self.xs = xs
 
         # TODO: enable inputs of different sizes within batch
 
@@ -209,7 +209,7 @@ class Gelu:
         self.last_x = None
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        self.last_x = x.clone()
+        self.last_x = x
         last_phi_plus_1 = 1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3))
         last_phi_plus_1 *= 0.5 * x
         # del last_phi_plus_1
@@ -251,7 +251,7 @@ class Softmax:
 
     def backward_cross_entropy(self, labels: torch.Tensor) -> torch.Tensor:
         n = self.probs.shape[0]
-        d_logits = self.probs.clone()
+        d_logits = self.probs
         for i in range(n):
             d_logits[i][labels[i]] -= 1
         # d_logits[range(n), labels] -= 1
@@ -296,7 +296,7 @@ class Linear:
         self.compute_dx = compute_dx
 
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
-        self.last_inputs = xs.clone()
+        self.last_inputs = xs
         ret = xs @ self.weights + self.bias
         return ret
 
@@ -549,35 +549,35 @@ class Attention:
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
-        self.x = x.clone()
-        self.q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
-        self.k = self.split_heads(self.k_map.forward(x, training)).transpose(
+        self.x  = x
+        q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
+        k = self.split_heads(self.k_map.forward(x, training)).transpose(
             -2, -1
         )  # B,nh,hs,T
-        self.v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        self.dot_prods1 = (self.q @ self.k) * self.inv_sqrt_head_size  # B,nh,T,T
+        v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
+        dot_prods1 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
         # del q, k
-        self.mask = torch.ones_like(self.dot_prods1).tril()
-        self.dot_prods2 = self.dot_prods1.masked_fill(self.mask == 0, float("-inf"))
+        mask = torch.ones_like(dot_prods1).tril()
+        self.dot_prods2 = dot_prods1.masked_fill(mask == 0, float("-inf"))
         # del mask
 
-        self.attention0 = self.softmax.forward(self.dot_prods2, training)
-        self.attention1 = self.dropout.forward(self.attention0, training)
-        self.attention2 = self.attention1 @ self.v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
-        self.attention3 = (
-            self.attention2.transpose(1, 2)
+        attention0 = self.softmax.forward(self.dot_prods2, training)
+        self.attention1 = self.dropout.forward(attention0, training)
+        attention0 = self.attention1 @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
+        attention0 = (
+            attention0.transpose(1, 2)
             .contiguous()
-            .view(self.attention2.shape[0], self.attention2.shape[2], self.n_embed)
+            .view(attention0.shape[0], attention0.shape[2], self.n_embed)
         )  # B,T,C
 
-        self.deltas = self.proj_map.forward(
-            self.attention3, training
+        deltas = self.proj_map.forward(
+            attention0, training
         )  # Still BTC, but now with the correct values
-        # del dot_prods1, dot_prods2, attention0, attention2, attention3
+        del dot_prods1, attention0, mask, q, k, v
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        return self.deltas
+        return deltas
 
     def backward(self, ddeltas: torch.Tensor) -> torch.Tensor:
         dattention3 = self.proj_map.backward(ddeltas)  # B,T,C
@@ -684,53 +684,36 @@ class TransformerBlock:
             ]
 
     def forward(self, x0: torch.Tensor, training: bool):
-        self.inter0: torch.Tensor = x0.clone()
-        self.inter01 = self.attention_section[0].forward(self.inter0, training)
-        torch.cuda.empty_cache()
-        self.inter02 = self.attention_section[1].forward(self.inter01, training)
-        torch.cuda.empty_cache()
-        self.inter03 = self.attention_section[2].forward(self.inter02, training)
-        torch.cuda.empty_cache()
-        # for layer in self.attention_section:
-        #     inter0 = layer.forward(inter0, training)
-        #     torch.cuda.empty_cache()
+        inter0: torch.Tensor = x0
+        for layer in self.attention_section:
+            inter0 = layer.forward(inter0, training)
+            torch.cuda.empty_cache()
 
-        x1 = self.inter03 + x0
-        self.inter1 = x1.clone()
+        x1 = inter0 + x0
+        inter1 = x1
+        for layer in self.MLP_section:
+            inter1 = layer.forward(inter1, training)
+            torch.cuda.empty_cache()
 
-        self.inter2 = self.MLP_section[0].forward(self.inter1, training)
-        self.inter3 = self.MLP_section[1].forward(self.inter2, training)
-        self.inter4 = self.MLP_section[2].forward(self.inter3, training)
-        self.inter5 = self.MLP_section[3].forward(self.inter4, training)
-        self.inter6 = self.MLP_section[4].forward(self.inter5, training)
-        # for layer in self.MLP_section:
-        #     inter1 = layer.forward(inter1, training)
-        #     torch.cuda.empty_cache()
-
-        self.x3 = self.inter6 + x1
-        return self.x3
+        return inter1 + x1
 
     def backward(self, dx3: torch.Tensor) -> torch.Tensor:
-        dinter6 = dx3.clone()
+        dinter6 = dx3
         dinters = [dinter6]
-        dx1 = dx3.clone()
+        dx1 = dx3
 
         for layer in reversed(self.MLP_section):
             dinters.append(layer.backward(dinters[-1]))
-            # dinter1 = dinters[-1]
-            # dinter1 = layer.backward(dinter1)
 
-        dx1 += dinters[-1].clone()
+        dx1 += dinters[-1]
 
-        dinter03 = dx1.clone()
-        dx0 = dx1.clone()
+        dinter03 = dx1
+        dx0 = dx1
 
         dinter02 = self.attention_section[2].backward(dinter03)
         dinter01 = self.attention_section[1].backward(dinter02)
         dinter0 = self.attention_section[0].backward(dinter01)
 
-        # for layer in reversed(self.attention_section):
-        #     dinter0 = layer.backward(dinter0)
         dx0 += dinter0
         return dx0
 
