@@ -33,6 +33,7 @@ class GPT2Model:
         self.C = C
         self.B = None
         self.T = None
+        self.xs = None
         self.vocab_size = vocab_size
         n_layers = len(weights.transformer)
         assert int(C / n_heads) == C / n_heads
@@ -54,8 +55,8 @@ class GPT2Model:
             self.final_ln = LayerNorm(None, None, C)
             self.lm_head = self.token_embeddings
         else:
-            self.token_embeddings = weights.wte
-            self.positional_embeddings = weights.wpe
+            self.token_embeddings = weights.wte.requires_grad_(True)
+            self.positional_embeddings = weights.wpe.requires_grad_(True)
             self.transformer_blocks = [
                 TransformerBlock(
                     n_embed=C,
@@ -91,20 +92,32 @@ class GPT2Model:
         position_emb = self.positional_embeddings[
             torch.arange(0, xs.shape[1]).to(device)
         ]
+        self.token_embeddings.retain_grad()
+        self.positional_embeddings.retain_grad()
 
         start = embeddings + position_emb
         self.B, self.T, C = start.shape
 
         filtered_start = self.initial_dropout.forward(start, True)
-        inter = filtered_start
+        inter0 = filtered_start
+        self.all_transformer_inters = []
         for block in self.transformer_blocks:
-            inter = block.forward(inter, True)
-        inter = self.final_ln.forward(inter, True)
+            inter0 = block.forward(inter0, True).requires_grad_(True)
+            inter0.retain_grad()
+            self.all_transformer_inters.append(inter0)
+        self.inter0 = inter0
+        self.inter0.retain_grad()
+        self.inter = self.final_ln.forward(inter0, True)
+        self.inter.retain_grad()
 
         if ys is not None:
-            self.pre_lm_head = inter.view((self.B * self.T), C)  # B*T training examples
-            logits = self.pre_lm_head @ self.lm_head.T
-            self.final_softmax.forward(logits, ys is not None)
+            self.pre_lm_head = self.inter.view(
+                (self.B * self.T), C
+            )  # B*T training examples
+            self.pre_lm_head.retain_grad()
+            self.logits = self.pre_lm_head @ self.lm_head.T
+            self.logits.retain_grad()
+            self.final_softmax.forward(self.logits, ys is not None)
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
@@ -114,10 +127,11 @@ class GPT2Model:
                 )
             )
             print(f"Loss: {loss}")
+            loss.backward()
             return self.final_softmax.probs.view((self.B, self.T, self.vocab_size))
         else:
             assert topk is not None
-            logits = (inter[:, -1, :] @ self.lm_head.T) / temperature
+            logits = (self.inter[:, -1, :] @ self.lm_head.T) / temperature
             vals, _ = torch.topk(logits, topk, 1)
             logits[logits < vals[:, [-1]]] = float("-inf")
             self.final_softmax.forward(logits, ys is not None)
@@ -164,12 +178,13 @@ class GPT2Model:
         self.dpos_embeddings = torch.zeros_like(self.positional_embeddings)
         for i in range(self.xs.shape[0]):
             for j in range(self.xs.shape[1]):
-                self.dtoken_embeddings[self.xs[i, j]] = doutput[i, j]
+                self.dtoken_embeddings[self.xs[i, j]] += doutput[i, j]
                 self.dpos_embeddings[j] += doutput[i, j]
         self.dtoken_embeddings += dlm_head_w.T
+        print("123")
 
     def apply_gradient(self, learning_rate: float) -> None:
-        self.final_ln.apply_gradient(learning_rate)
+        # self.final_ln.apply_gradient(learning_rate)
         for layer in reversed(self.transformer_blocks):
             layer.apply_gradient(learning_rate)
         self.initial_dropout.apply_gradient(learning_rate)
@@ -204,7 +219,7 @@ class Gelu:
         self.last_x = None
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        self.last_x = x
+        self.last_x = x.clone()
         last_phi_plus_1 = 1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3))
         last_phi_plus_1 *= 0.5 * x
         # del last_phi_plus_1
@@ -235,23 +250,25 @@ class Softmax:
         self.dimension = dimension
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        x = x - torch.max(x, dim=self.dimension, keepdim=True).values
+        x2 = x - torch.max(x, dim=self.dimension, keepdim=True).values
         # exps = torch.exp(x)
-        x.exp_()
-        denominators = torch.sum(x, dim=self.dimension, keepdim=True)
+        x3 = x2.exp()
+        denominators = torch.sum(x3, dim=self.dimension, keepdim=True)
 
         # probs = (x / denominators)
-        self.probs = x.div_(denominators)
+        self.probs = x3.div(denominators)
         return self.probs
 
     def backward_cross_entropy(self, labels: torch.Tensor) -> torch.Tensor:
         n = self.probs.shape[0]
-        d_logits = self.probs.clone()
-        d_logits[range(n), labels] -= 1
+        d_logits = self.probs.clone().requires_grad_(True)
+        for i in range(n):
+            d_logits[i][labels[i]] -= 1
+        # d_logits[range(n), labels] -= 1
         return d_logits / n
 
-    def backward(self, doutput: torch.Tensor) -> torch.Tensor:
-        doutput - torch.sum(doutput * self.probs, dim=self.dimension, keepdim=True)
+    def backward(self, doutput: torch.Tensor, answer) -> torch.Tensor:
+        doutput -= torch.sum(doutput * self.probs, dim=self.dimension, keepdim=True)
         dlogits = doutput * self.probs
         # probs_extended = self.probs.unsqueeze(2)
         # jacobian = torch.diagflat(self.probs) - torch.matmul(
@@ -287,9 +304,11 @@ class Linear:
         self.dW = None
         self.dbias = None
         self.compute_dx = compute_dx
+        self.weights.requires_grad_(True)
+        self.bias.requires_grad_(True)
 
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
-        self.last_inputs = xs.clone()
+        self.last_inputs = xs.clone().requires_grad_(True)
         ret = xs @ self.weights + self.bias
         return ret
 
@@ -327,6 +346,8 @@ class LayerNorm:
         self.x_hat = None  # Used in backprop
         self.d_bias = None
         self.d_gain = None
+        self.bn_gain.requires_grad_(True)
+        self.bn_bias.requires_grad_(True)
 
     def forward(
         self,
@@ -542,35 +563,42 @@ class Attention:
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
-        self.x = x.clone()
-        q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
-        k = self.split_heads(self.k_map.forward(x, training)).transpose(
+        self.x = x.clone().requires_grad_(True)
+        self.q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
+        self.k = self.split_heads(self.k_map.forward(x, training)).transpose(
             -2, -1
         )  # B,nh,hs,T
-        v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        dot_prods = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
-        del q, k
-        mask = torch.ones_like(dot_prods).tril()
-        dot_prods.masked_fill_(mask == 0, float("-inf"))
-        del mask
+        self.v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
+        self.dot_prods1 = (self.q @ self.k) * self.inv_sqrt_head_size  # B,nh,T,T
+        self.dot_prods1.retain_grad()
+        # del q, k
+        self.mask = torch.ones_like(self.dot_prods1).tril()
+        self.dot_prods2 = self.dot_prods1.masked_fill(self.mask == 0, float("-inf"))
+        self.dot_prods2.retain_grad()
+        # del mask
 
-        attention0 = self.softmax.forward(dot_prods, training)
-        self.attention1 = self.dropout.forward(attention0, training)
-        attention2 = self.attention1 @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
-        attention3 = (
-            attention2.transpose(1, 2)
+        self.attention0 = self.softmax.forward(self.dot_prods2, training)
+        self.attention0.retain_grad()
+        self.attention1 = self.dropout.forward(self.attention0, training)
+        self.attention1.retain_grad()
+        self.attention2 = self.attention1 @ self.v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
+        self.attention2.retain_grad()
+        self.attention3 = (
+            self.attention2.transpose(1, 2)
             .contiguous()
-            .view(attention2.shape[0], attention2.shape[2], self.n_embed)
+            .view(self.attention2.shape[0], self.attention2.shape[2], self.n_embed)
         )  # B,T,C
+        self.attention3.retain_grad()
 
-        deltas = self.proj_map.forward(
-            attention3, training
+        self.deltas = self.proj_map.forward(
+            self.attention3, training
         )  # Still BTC, but now with the correct values
-        del dot_prods, attention0, attention2, attention3
+        self.deltas.retain_grad()
+        # del dot_prods1, dot_prods2, attention0, attention2, attention3
         if device == "cuda":
             torch.cuda.empty_cache()
 
-        return deltas
+        return self.deltas
 
     def backward(self, ddeltas: torch.Tensor) -> torch.Tensor:
         dattention3 = self.proj_map.backward(ddeltas)  # B,T,C
@@ -590,7 +618,7 @@ class Attention:
         dattention1 = dattention2 @ v.transpose(-2, -1)
         dv = self.attention1.transpose(-2, -1) @ dattention2
         dattention0 = self.dropout.backward(dattention1)
-        ddot_prods = self.softmax.backward(dattention0)
+        ddot_prods = self.softmax.backward(dattention0, self.dot_prods2.grad)
 
         # Grads should not flow where mask == 0
         mask = torch.ones_like(ddot_prods).tril()
@@ -677,34 +705,65 @@ class TransformerBlock:
             ]
 
     def forward(self, x0: torch.Tensor, training: bool):
-        inter0: torch.Tensor = x0.clone()  # Intermediate output
-        for layer in self.attention_section:
-            inter0 = layer.forward(inter0, training)
-            torch.cuda.empty_cache()
+        self.inter0: torch.Tensor = x0.clone().requires_grad_(
+            True
+        )  # Intermediate output
+        self.inter01 = self.attention_section[0].forward(self.inter0, training)
+        self.inter01.retain_grad()
+        torch.cuda.empty_cache()
+        self.inter02 = self.attention_section[1].forward(self.inter01, training)
+        self.inter02.retain_grad()
+        torch.cuda.empty_cache()
+        self.inter03 = self.attention_section[2].forward(self.inter02, training)
+        self.inter03.retain_grad()
+        torch.cuda.empty_cache()
+        # for layer in self.attention_section:
+        #     inter0 = layer.forward(inter0, training)
+        #     torch.cuda.empty_cache()
 
-        x1 = inter0 + x0
-        inter1 = x1.clone()
+        x1 = self.inter03 + x0
+        self.inter1 = x1.clone()
+        self.inter1.retain_grad()
 
-        for layer in self.MLP_section:
-            inter1 = layer.forward(inter1, training)
-            torch.cuda.empty_cache()
+        self.inter2 = self.MLP_section[0].forward(self.inter1, training)
+        self.inter2.retain_grad()
+        self.inter3 = self.MLP_section[1].forward(self.inter2, training)
+        self.inter3.retain_grad()
+        self.inter4 = self.MLP_section[2].forward(self.inter3, training)
+        self.inter4.retain_grad()
+        self.inter5 = self.MLP_section[3].forward(self.inter4, training)
+        self.inter5.retain_grad()
+        self.inter6 = self.MLP_section[4].forward(self.inter5, training)
+        self.inter6.retain_grad()
+        # for layer in self.MLP_section:
+        #     inter1 = layer.forward(inter1, training)
+        #     torch.cuda.empty_cache()
 
-        x3 = inter1 + x1
-        return x3
+        self.x3 = self.inter6 + x1
+        self.x3.retain_grad()
+        return self.x3
 
     def backward(self, dx3: torch.Tensor) -> torch.Tensor:
-        dinter1 = dx3.clone()
-        dx1 = dx3.clone()
+        dinter6 = dx3.clone().requires_grad_(True)
+        dinters = [dinter6]
+        dx1 = dx3.clone().requires_grad_(True)
 
         for layer in reversed(self.MLP_section):
-            dinter1 = layer.backward(dinter1)
-        dx1 += dinter1.clone()
+            dinters.append(layer.backward(dinters[-1]))
+            # dinter1 = dinters[-1]
+            # dinter1 = layer.backward(dinter1)
 
-        dinter0 = dx1.clone()
-        dx0 = dx1.clone()
+        dx1 += dinters[-1].clone().requires_grad_(True)
 
-        for layer in reversed(self.attention_section):
-            dinter0 = layer.backward(dinter0)
+        dinter03 = dx1.clone().requires_grad_(True)
+        dx0 = dx1.clone().requires_grad_(True)
+
+        dinter02 = self.attention_section[2].backward(dinter03)
+        dinter01 = self.attention_section[1].backward(dinter02)
+        dinter0 = self.attention_section[0].backward(dinter01)
+
+        # for layer in reversed(self.attention_section):
+        #     dinter0 = layer.backward(dinter0)
         dx0 += dinter0
         return dx0
 
