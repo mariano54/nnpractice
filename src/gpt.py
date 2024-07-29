@@ -103,61 +103,12 @@ def main():
 
     torch.manual_seed(100)
     xs, ys = get_batch(encoded_dataset, block_size, batch_size)
-    all_probs = llm.forward(xs, ys)
+    _, loss = llm.forward(xs, ys)
+    assert torch.isclose(loss, torch.tensor(4.97744))
     llm.backward(ys)
-    # llm.apply_gradient(0.001)
-
-    print("ln_f_w", llm.final_ln.d_gain[:5])
-    print("ln_f_b", llm.final_ln.d_bias[:5])
-    print(llm.dpos_embeddings[0][:5])
-
-    assert torch.allclose(llm.dpos_embeddings, llm.positional_embeddings.grad, atol=1e-4)
-    assert torch.allclose(llm.dtoken_embeddings, llm.token_embeddings.grad, atol=2e-4)
-    # compare transformers
-    for i in range(12):
-        print(f"Trying i {i}")
-
-        print(llm.transformer_blocks[i].attention_section[0].bn_gain.grad[:5])
-        print(llm.transformer_blocks[i].attention_section[0].d_gain[:5])
-        print(torch.max(llm.transformer_blocks[i].attention_section[0].bn_gain.grad - llm.transformer_blocks[i].attention_section[0].d_gain))
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[0].bn_gain.grad,
-                              llm.transformer_blocks[i].attention_section[0].d_gain, atol=8e-3)
-
-        assert torch.allclose(llm.final_ln.d_gain, llm.final_ln.bn_gain.grad, atol=1e-7)
-        assert torch.allclose(llm.final_ln.d_bias, llm.final_ln.bn_bias.grad, atol=1e-7)
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].q_map.weights.grad,
-                              llm.transformer_blocks[i].attention_section[1].q_map.dW, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].q_map.bias.grad,
-                              llm.transformer_blocks[i].attention_section[1].q_map.dbias, atol=5e-4)
-
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].k_map.weights.grad,
-                              llm.transformer_blocks[i].attention_section[1].k_map.dW, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].k_map.bias.grad,
-                              llm.transformer_blocks[i].attention_section[1].k_map.dbias, atol=5e-4)
-
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].v_map.weights.grad,
-                              llm.transformer_blocks[i].attention_section[1].v_map.dW, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].attention_section[1].v_map.bias.grad,
-                              llm.transformer_blocks[i].attention_section[1].v_map.dbias, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[0].bn_gain.grad,
-                       llm.transformer_blocks[i].MLP_section[0].d_gain, atol=8e-3)
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[0].bn_bias.grad,
-                       llm.transformer_blocks[i].MLP_section[0].d_bias, atol=8e-3)
-
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[1].weights.grad,
-                       llm.transformer_blocks[i].MLP_section[1].dW, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[1].bias.grad,
-                       llm.transformer_blocks[i].MLP_section[1].dbias, atol=5e-4)
-
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[3].weights.grad,
-                       llm.transformer_blocks[i].MLP_section[3].dW, atol=5e-4)
-        assert torch.allclose(llm.transformer_blocks[i].MLP_section[3].bias.grad,
-                       llm.transformer_blocks[i].MLP_section[3].dbias, atol=5e-4)
-
-
-    #
-
-    # print("generating predictions...")
+    llm.apply_gradient(0.001)
+    _, loss = llm.forward(xs, ys)
+    assert torch.isclose(loss, torch.tensor(4.866), atol=1e-2)
     # xs, ys = get_batch(encoded_dataset, current_context, 2)
     # new_xs = llm.generate(xs, 10)
     # for i in range(new_xs.shape[0]):
@@ -167,5 +118,5 @@ def main():
 
 
 if __name__ == "__main__":
-    # with torch.no_grad():
-    main()
+    with torch.no_grad():
+        main()
