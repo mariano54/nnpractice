@@ -1,16 +1,17 @@
 import dataclasses
 import pickle
+import time
 from contextlib import nullcontext
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 from src.gpt2_weights import GPT2Weights
 
 import torch
 
 device = "cuda"
-torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
+torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 dtype = (
     "bfloat16"
     if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
@@ -42,6 +43,19 @@ def get_batch(dataset: List[int], block_size: int, batch_size: int):
 
 
 from src.neural_net import GPT2Model, device
+def get_batch_consecutive(dataset: List[int], block_size: int, batch_size: int, index_start: int):
+    xs = []
+    ys = []
+    for i in range(batch_size):
+        start = index_start + i*block_size
+        end = min(start + block_size + 1, len(dataset) - 1)
+        data_slice = torch.tensor(dataset[start:end])
+        xs.append(data_slice[:-1])
+        ys.append(data_slice[1:])
+        if end > len(dataset) - 1:
+            break
+    return torch.stack(xs).to(device), torch.stack(ys).to(device)
+
 
 def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[int]):
     if Path("data/gpt2_weights.pkl").is_file():
@@ -61,7 +75,6 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     llm = GPT2Model(
         weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout
     )
-    torch.autograd.set_detect_anomaly(True)
     first_encoding = torch.tensor(
         [
             gpt2_tokenizer.encode("I am very curious about"),
@@ -89,6 +102,44 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     _, loss = llm.forward(xs, ys)
     assert torch.isclose(loss, torch.tensor(4.866), atol=2e-2)
 
+
+def calculate_loss(llm: GPT2Model, dataset: List[int]) -> float:
+    torch.manual_seed(100)
+    losses = []
+    for index in range(0, len(dataset), llm.max_B):
+        print(f"Running batch at index {index}")
+        xs, ys = get_batch_consecutive(dataset, llm.max_T, llm.max_B, index)
+        probs, loss = llm.forward(xs, ys)
+        losses.append(loss * probs.shape[0] / llm.max_B)  # Normalize for the final batch (maybe smaller)
+    return torch.Tensor(losses).mean().item()
+
+
+def train(llm: GPT2Model, dataset: List[int]):
+    step_size = 0.003
+    train_up_to = int(len(dataset) * 0.8)
+    train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
+
+    torch.manual_seed(100)
+    for i in range(1000):
+        start_t = time.time()
+        xs, ys = get_batch(train_set, llm.max_T, llm.max_B)
+        print(f"getbatch: {time.time() - start_t}")
+        _, loss = llm.forward(xs, ys)
+        print(f"forward: {time.time() - start_t}")
+        # print(f"Loss for batch {i} {loss}")
+        llm.backward(ys)
+        print(f"backward: {time.time() - start_t}")
+        llm.apply_gradient(step_size)
+        print(f"apply gradient: {time.time() - start_t}")
+        quit()
+
+        if i % 100 == 0:
+            train_loss = calculate_loss(llm, train_set)
+            test_loss = calculate_loss(llm, test_set)
+            print(f"Training loss: {train_loss}")
+            print(f"Testing loss: {test_loss}")
+
+
 def main():
     # Below configuration taken from https://github.com/karpathy/nanoGPT
     seed = 1337
@@ -110,7 +161,32 @@ def main():
             encoded_dataset,
         )
         assert decoded == text
-    test_forward_backward(gpt2_tokenizer, encoded_dataset)
+    # test_forward_backward(gpt2_tokenizer, encoded_dataset)
+
+    batch_size = 8
+    block_size = 256
+    emb_dimension = 768
+    vocab_size = 50257
+    n_heads = 12
+    dropout = 0.0
+
+    # with ctx:
+    llm = GPT2Model(
+        None, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout
+    )
+    train(llm, dataset=encoded_dataset)
+
+    # first_encoding = torch.tensor(
+    #     [
+    #         gpt2_tokenizer.encode("I am very curious about"),
+    #         gpt2_tokenizer.encode("Why do you always complain"),
+    #     ],
+    #     dtype=torch.long,
+    # )
+    # new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
+    # results = []
+    # for i in range(new_tokens.shape[0]):
+    #     results.append(gpt2_tokenizer.decode(new_tokens[i][:].tolist()))
 
     # xs, ys = get_batch(encoded_dataset, current_context, 2)
     # new_xs = llm.generate(xs, 10)

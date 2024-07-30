@@ -12,7 +12,7 @@ def linear_rw(input_dim: int, output_dim: int, zero_biases: bool= False, residua
         std_dev /= 2 * math.sqrt(residual_scaling_num_layers)
 
     weights = (
-        torch.normal(mean=0, std=std_dev, size=(output_dim, input_dim))
+        torch.normal(mean=0, std=std_dev, size=(input_dim, output_dim))
         .float()
         .to(device)
     )

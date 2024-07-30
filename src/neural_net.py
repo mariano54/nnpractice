@@ -1,3 +1,4 @@
+import time
 from typing import List, Optional, Tuple
 
 import math
@@ -35,11 +36,11 @@ class GPT2Model:
         self.T = None
         self.xs = None
         self.vocab_size = vocab_size
-        n_layers = len(weights.transformer)
         assert int(C / n_heads) == C / n_heads
 
         self.initial_dropout = Dropout(dropout)
         if weights is None:
+            n_layers = 12
             std = 1 / math.sqrt(C)
             self.token_embeddings = torch.normal(0, std, (vocab_size, C)).to(device)
             self.positional_embeddings = torch.normal(0, std, (T, C)).to(device)
@@ -55,6 +56,7 @@ class GPT2Model:
             self.final_ln = LayerNorm(None, None, C)
             self.lm_head = self.token_embeddings
         else:
+            n_layers = len(weights.transformer)
             self.token_embeddings = weights.wte
             self.positional_embeddings = weights.wpe
             self.transformer_blocks = [
@@ -82,35 +84,42 @@ class GPT2Model:
         temperature: float = 1,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # xs and ys are shape (B,T)
+        start_t = time.time()
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
         self.xs = xs
-
+        print(f"1: {time.time() - start_t}")
         # TODO: enable inputs of different sizes within batch
 
         embeddings = self.token_embeddings[xs]  # Should result in B,T,C vector
         position_emb = self.positional_embeddings[
             torch.arange(0, xs.shape[1]).to(device)
         ]
+        print(f"2: {time.time() - start_t}")
 
         start = embeddings + position_emb
         self.B, self.T, C = start.shape
 
         filtered_start = self.initial_dropout.forward(start, True)
         inter0 = filtered_start
+        print(f"3: {time.time() - start_t}")
         self.all_transformer_inters = []
         for block in self.transformer_blocks:
             inter0 = block.forward(inter0, True)
+            print(f"3.T: {time.time() - start_t}")
             self.all_transformer_inters.append(inter0)
         self.inter0 = inter0
         self.inter = self.final_ln.forward(inter0, True)
+        print(f"4: {time.time() - start_t}")
 
         if ys is not None:
             self.pre_lm_head = self.inter.view(
                 (self.B * self.T), C
             )  # B*T training examples
+            print(f"5: {time.time() - start_t}")
             self.logits = self.pre_lm_head @ self.lm_head.T
             self.final_softmax.forward(self.logits, ys is not None)
+            print(f"6: {time.time() - start_t}")
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
@@ -119,7 +128,7 @@ class GPT2Model:
                     ]
                 )
             )
-            print(f"Loss: {loss}")
+            print(f"7: {time.time() - start_t}")
             return self.final_softmax.probs.view((self.B, self.T, self.vocab_size)), loss
         else:
             assert topk is not None
@@ -549,33 +558,49 @@ class Attention:
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
+        start_t = time.time()
         self.x  = x
+        print(f"\t\tA1: {time.time() - start_t}")
         q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
+        print(f"\t\tA1: {time.time() - start_t}")
         k = self.split_heads(self.k_map.forward(x, training)).transpose(
             -2, -1
         )  # B,nh,hs,T
+        print(f"\t\tA1: {time.time() - start_t}")
         v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        dot_prods1 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
+        print(f"\t\tA2: {time.time() - start_t}")
+        self.dot_prods2 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
+        print(f"\t\tA3: {time.time() - start_t}")
         # del q, k
-        mask = torch.ones_like(dot_prods1).tril()
-        self.dot_prods2 = dot_prods1.masked_fill(mask == 0, float("-inf"))
+        mask = torch.ones_like(self.dot_prods2).tril()
+        print(f"\t\tA4: {time.time() - start_t}")
+
+        self.dot_prods2.masked_fill_(mask == 0, float("-inf"))
+        print(f"\t\tA5: {time.time() - start_t}")
         # del mask
 
         attention0 = self.softmax.forward(self.dot_prods2, training)
+        print(f"\t\tA6: {time.time() - start_t}")
         self.attention1 = self.dropout.forward(attention0, training)
+        print(f"\t\tA7: {time.time() - start_t}")
         attention0 = self.attention1 @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
+        print(f"\t\tA8: {time.time() - start_t}")
         attention0 = (
             attention0.transpose(1, 2)
             .contiguous()
             .view(attention0.shape[0], attention0.shape[2], self.n_embed)
         )  # B,T,C
+        print(f"\t\tA9: {time.time() - start_t}")
 
         deltas = self.proj_map.forward(
             attention0, training
         )  # Still BTC, but now with the correct values
-        del dot_prods1, attention0, mask, q, k, v
+        print(f"\t\tA10: {time.time() - start_t}")
+        del attention0, mask, q, k, v
+        print(f"\t\tA11: {time.time() - start_t}")
         if device == "cuda":
             torch.cuda.empty_cache()
+        print(f"\t\tA12: {time.time() - start_t}")
 
         return deltas
 
@@ -684,15 +709,21 @@ class TransformerBlock:
             ]
 
     def forward(self, x0: torch.Tensor, training: bool):
+        start_t = time.time()
+        print(f"\tT1: {time.time() - start_t}")
         inter0: torch.Tensor = x0
         for layer in self.attention_section:
             inter0 = layer.forward(inter0, training)
+            print(f"\tT2: {time.time() - start_t}")
             torch.cuda.empty_cache()
 
         x1 = inter0 + x0
+        print(f"\tT3: {time.time() - start_t}")
         inter1 = x1
+        print(f"\tT4: {time.time() - start_t}")
         for layer in self.MLP_section:
             inter1 = layer.forward(inter1, training)
+            print(f"\tT5: {time.time() - start_t}")
             torch.cuda.empty_cache()
 
         return inter1 + x1
