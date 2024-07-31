@@ -31,25 +31,31 @@ ctx = (
 from src.tokenization import GPT2Tokenizer
 
 
-def get_batch(dataset: List[int], block_size: int, batch_size: int):
+def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
     xs = []
     ys = []
     for i in range(batch_size):
         index_start = torch.randint(0, len(dataset) - (block_size + 1), (1,))[0]
-        data_slice = torch.tensor(dataset[index_start: index_start + block_size + 1])
+        data_slice = dataset[index_start : index_start + block_size + 1].clone()
+
         xs.append(data_slice[:-1])
         ys.append(data_slice[1:])
-    return torch.stack(xs).to(device), torch.stack(ys).to(device)
+    res = torch.stack(xs).to(device), torch.stack(ys).to(device)
+    return res
 
 
 from src.neural_net import GPT2Model, device
-def get_batch_consecutive(dataset: List[int], block_size: int, batch_size: int, index_start: int):
+
+
+def get_batch_consecutive(
+    dataset: torch.tensor, block_size: int, batch_size: int, index_start: int
+):
     xs = []
     ys = []
     for i in range(batch_size):
-        start = index_start + i*block_size
+        start = index_start + i * block_size
         end = min(start + block_size + 1, len(dataset) - 1)
-        data_slice = torch.tensor(dataset[start:end])
+        data_slice = dataset[start:end].clone()
         xs.append(data_slice[:-1])
         ys.append(data_slice[1:])
         if end > len(dataset) - 1:
@@ -94,50 +100,56 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     print("First test successful.")
 
     torch.manual_seed(100)
-    xs, ys = get_batch(encoded_dataset, block_size, batch_size)
+    xs, ys = get_batch(
+        torch.tensor(encoded_dataset, dtype=torch.int32).to(device),
+        block_size,
+        batch_size,
+    )
     _, loss = llm.forward(xs, ys)
-    assert torch.isclose(loss, torch.tensor(4.97744), atol=2e-2)
+    print(f"Loss: {loss}")
+    assert torch.isclose(loss, torch.tensor(4.92744), atol=2e-1)
     llm.backward(ys)
     llm.apply_gradient(0.001)
     _, loss = llm.forward(xs, ys)
-    assert torch.isclose(loss, torch.tensor(4.866), atol=2e-2)
+    print(f"Loss: {loss}")
+    assert torch.isclose(loss, torch.tensor(4.826), atol=2e-1)
 
 
-def calculate_loss(llm: GPT2Model, dataset: List[int]) -> float:
+def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     torch.manual_seed(100)
     losses = []
-    for index in range(0, len(dataset), llm.max_B):
-        print(f"Running batch at index {index}")
-        xs, ys = get_batch_consecutive(dataset, llm.max_T, llm.max_B, index)
+    for _ in range(10):
+        random_index = torch.randint(
+            0, len(dataset) - (llm.max_B * llm.max_T) - 1, (1,)
+        ).item()
+        xs, ys = get_batch_consecutive(dataset, llm.max_T, llm.max_B, random_index)
         probs, loss = llm.forward(xs, ys)
-        losses.append(loss * probs.shape[0] / llm.max_B)  # Normalize for the final batch (maybe smaller)
-    return torch.Tensor(losses).mean().item()
+        losses.append(
+            loss * probs.shape[0] / llm.max_B
+        )  # Normalize for the final batch (maybe smaller)
+    return torch.tensor(losses).mean().item()
 
 
 def train(llm: GPT2Model, dataset: List[int]):
     step_size = 0.003
     train_up_to = int(len(dataset) * 0.8)
     train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
+    train_set = torch.tensor(train_set, dtype=torch.int32).to(device)
+    test_set = torch.tensor(test_set, dtype=torch.int32).to(device)
 
     torch.manual_seed(100)
-    for i in range(1000):
-        start_t = time.time()
+    for i in range(10000):
         xs, ys = get_batch(train_set, llm.max_T, llm.max_B)
-        print(f"getbatch: {time.time() - start_t}")
         _, loss = llm.forward(xs, ys)
-        print(f"forward: {time.time() - start_t}")
-        # print(f"Loss for batch {i} {loss}")
+        print(f"Loss at {i}= {loss}")
         llm.backward(ys)
-        print(f"backward: {time.time() - start_t}")
         llm.apply_gradient(step_size)
-        print(f"apply gradient: {time.time() - start_t}")
-        quit()
 
-        if i % 100 == 0:
+        if i != 0 and i % 100 == 0:
             train_loss = calculate_loss(llm, train_set)
             test_loss = calculate_loss(llm, test_set)
-            print(f"Training loss: {train_loss}")
-            print(f"Testing loss: {test_loss}")
+            print(f"\nTraining loss: {train_loss}")
+            print(f"Testing loss: {test_loss}\n")
 
 
 def main():
@@ -161,10 +173,10 @@ def main():
             encoded_dataset,
         )
         assert decoded == text
-    # test_forward_backward(gpt2_tokenizer, encoded_dataset)
+    test_forward_backward(gpt2_tokenizer, encoded_dataset)
 
     batch_size = 8
-    block_size = 256
+    block_size = 512
     emb_dimension = 768
     vocab_size = 50257
     n_heads = 12

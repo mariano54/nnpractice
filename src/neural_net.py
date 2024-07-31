@@ -16,6 +16,21 @@ device = "cuda"
 print(f"Using {device} device")
 
 
+def adam_update(
+    learning_rate: float,
+    betas: Tuple[float, float],
+    m: torch.tensor,
+    v: torch.tensor,
+    deriv: torch.tensor,  # Gradients
+    t: int,
+) -> torch.tensor:
+    new_mw = betas[0] * m + (1 - betas[0]) * deriv
+    new_mw_corr = new_mw / (1 - betas[0] ** t)
+    new_vw = betas[1] * v + (1 - betas[1]) * (deriv * 2)
+    new_vw_corr = new_vw / (1 - betas[1] ** t)
+    return learning_rate * new_mw_corr / (torch.sqrt(new_vw_corr) + 10e-8)
+
+
 class GPT2Model:
     def __init__(
         self,
@@ -26,6 +41,7 @@ class GPT2Model:
         vocab_size: int,
         n_heads: int,
         dropout: float,
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         self.dtoken_embeddings = None
         self.dpos_embeddings = None
@@ -50,6 +66,7 @@ class GPT2Model:
                     n_heads=n_heads,
                     dropout=dropout,
                     transformer_weights=None,
+                    adam_betas=adam_betas,
                 )
                 for _ in range(n_layers)
             ]
@@ -65,11 +82,12 @@ class GPT2Model:
                     n_heads=n_heads,
                     dropout=dropout,
                     transformer_weights=weights.transformer[i],
+                    adam_betas=adam_betas,
                 )
                 for i in range(n_layers)
             ]
             self.final_ln = LayerNorm(
-                weights.transformer_ln_f_weight, weights.transformer_ln_f_bias, None
+                weights.transformer_ln_f_weight, weights.transformer_ln_f_bias, None, adam_betas
             )
             self.pre_lm_head = None
             self.lm_head = weights.wte
@@ -84,42 +102,30 @@ class GPT2Model:
         temperature: float = 1,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         # xs and ys are shape (B,T)
-        start_t = time.time()
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
         self.xs = xs
-        print(f"1: {time.time() - start_t}")
         # TODO: enable inputs of different sizes within batch
 
         embeddings = self.token_embeddings[xs]  # Should result in B,T,C vector
-        position_emb = self.positional_embeddings[
-            torch.arange(0, xs.shape[1]).to(device)
-        ]
-        print(f"2: {time.time() - start_t}")
+        position_emb = self.positional_embeddings[torch.arange(0, xs.shape[1]).to(device)]
 
         start = embeddings + position_emb
         self.B, self.T, C = start.shape
 
         filtered_start = self.initial_dropout.forward(start, True)
         inter0 = filtered_start
-        print(f"3: {time.time() - start_t}")
         self.all_transformer_inters = []
         for block in self.transformer_blocks:
             inter0 = block.forward(inter0, True)
-            print(f"3.T: {time.time() - start_t}")
             self.all_transformer_inters.append(inter0)
         self.inter0 = inter0
         self.inter = self.final_ln.forward(inter0, True)
-        print(f"4: {time.time() - start_t}")
 
         if ys is not None:
-            self.pre_lm_head = self.inter.view(
-                (self.B * self.T), C
-            )  # B*T training examples
-            print(f"5: {time.time() - start_t}")
+            self.pre_lm_head = self.inter.view((self.B * self.T), C)  # B*T training examples
             self.logits = self.pre_lm_head @ self.lm_head.T
             self.final_softmax.forward(self.logits, ys is not None)
-            print(f"6: {time.time() - start_t}")
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
@@ -128,8 +134,10 @@ class GPT2Model:
                     ]
                 )
             )
-            print(f"7: {time.time() - start_t}")
-            return self.final_softmax.probs.view((self.B, self.T, self.vocab_size)), loss
+            return (
+                self.final_softmax.probs.view((self.B, self.T, self.vocab_size)),
+                loss,
+            )
         else:
             assert topk is not None
             logits = (self.inter[:, -1, :] @ self.lm_head.T) / temperature
@@ -138,31 +146,23 @@ class GPT2Model:
             self.final_softmax.forward(logits, ys is not None)
             return self.final_softmax.probs, None
 
-    def generate(
-        self, xs: torch.Tensor, n_tokens: int, topk: int, temperature: float = 1.0
-    ):
+    def generate(self, xs: torch.Tensor, n_tokens: int, topk: int, temperature: float = 1.0):
         B = xs.shape[0]  # batch size
         initial_len = xs.shape[1]
         assert B <= self.max_B
         while xs.shape[1] < initial_len + n_tokens:
-            last_word_probs, _ = self.forward(
-                xs[:, -self.max_T :], None, topk, temperature
-            )
+            last_word_probs, _ = self.forward(xs[:, -self.max_T :], None, topk, temperature)
             last_gen_token: List[int] = []
             for batch_index in range(B):
                 one_stream_probs = last_word_probs[batch_index]
                 sampled_token = torch.multinomial(one_stream_probs, num_samples=1)
                 last_gen_token.append(sampled_token.item())
-            xs = torch.cat(
-                (xs, torch.tensor(last_gen_token).unsqueeze(1).to(device)), dim=1
-            )
+            xs = torch.cat((xs, torch.tensor(last_gen_token).unsqueeze(1).to(device)), dim=1)
         return xs
 
     def backward(self, labels: torch.Tensor) -> None:
         assert self.final_softmax.probs is not None
-        dlogits = self.final_softmax.backward_cross_entropy(
-            labels.view((self.B * self.T), 1)
-        )
+        dlogits = self.final_softmax.backward_cross_entropy(labels.view((self.B * self.T), 1))
 
         dpre_lm_head = dlogits @ self.lm_head
         dlm_head_w = self.pre_lm_head.T @ dlogits
@@ -177,10 +177,20 @@ class GPT2Model:
 
         self.dtoken_embeddings = torch.zeros_like(self.token_embeddings)
         self.dpos_embeddings = torch.zeros_like(self.positional_embeddings)
-        for i in range(self.xs.shape[0]):
-            for j in range(self.xs.shape[1]):
-                self.dtoken_embeddings[self.xs[i, j]] += doutput[i, j]
-                self.dpos_embeddings[j] += doutput[i, j]
+        indices = self.xs.view(-1)
+        updates = doutput.view(-1, doutput.size(-1))
+        self.dtoken_embeddings.index_add_(0, indices, updates)
+
+        if doutput.shape[1] < self.dpos_embeddings.shape[0]:
+            new_cols = torch.zeros(
+                (
+                    self.dpos_embeddings.shape[0] - doutput.shape[1],
+                    self.dpos_embeddings.shape[1],
+                )
+            ).to(device)
+            self.dpos_embeddings += torch.cat((doutput.sum(dim=0), new_cols), dim=0)
+        else:
+            self.dpos_embeddings += doutput.sum(dim=0)
         self.dtoken_embeddings += dlm_head_w.T
 
     def apply_gradient(self, learning_rate: float) -> None:
@@ -226,16 +236,11 @@ class Gelu:
         return last_phi_plus_1
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
-        last_phi = torch.tanh(
-            math.sqrt(2 / math.pi) * (self.last_x + 0.044715 * self.last_x**3)
-        )
+        last_phi = torch.tanh(math.sqrt(2 / math.pi) * (self.last_x + 0.044715 * self.last_x**3))
         dgelu = 0.5 * (
             1
             + last_phi
-            + self.last_x
-            * math.sqrt(2 / math.pi)
-            * (1 + 0.13145 * self.last_x**2)
-            * (1 - last_phi**2)
+            + self.last_x * math.sqrt(2 / math.pi) * (1 + 0.13145 * self.last_x**2) * (1 - last_phi**2)
         )
         return dgelu * doutput
 
@@ -290,6 +295,7 @@ class Linear:
         output_dim: Optional[int] = None,
         zero_biases: bool = False,
         residual_scaling_num_layers: Optional[int] = None,
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         assert (weights is not None) == (bias is not None)
         if weights is not None:
@@ -303,6 +309,14 @@ class Linear:
         self.dW = None
         self.dbias = None
         self.compute_dx = compute_dx
+        self.t = 0  # Time step
+
+        # Gradient optimization values iff adam_betas is not None
+        self.adam_betas = adam_betas
+        self.mw = torch.zeros_like(self.weights).to(device)
+        self.mb = torch.zeros(self.bias).to(device)
+        self.vw = torch.zeros_like(self.weights).to(device)
+        self.vb = torch.zeros_like(self.bias).to(device)
 
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
         self.last_inputs = xs
@@ -313,9 +327,7 @@ class Linear:
         return xs @ self.weights + self.bias
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
-        last_inputs_reshaped = self.last_inputs.reshape(
-            -1, self.last_inputs.shape[-1]
-        ).T
+        last_inputs_reshaped = self.last_inputs.reshape(-1, self.last_inputs.shape[-1]).T
         self.dW = last_inputs_reshaped @ doutput.reshape(-1, doutput.shape[-1])
         self.dbias = doutput.sum((0, 1))
         if self.compute_dx:
@@ -323,8 +335,13 @@ class Linear:
         return torch.Tensor()
 
     def apply_gradient(self, learning_rate: float):
-        self.weights -= learning_rate * self.dW
-        self.bias -= learning_rate * self.dbias
+        if self.adam_betas is not None:
+            self.weights -= adam_update(learning_rate, self.adam_betas, self.mw, self.vw, self.dW, self.t)
+            self.bias -= adam_update(learning_rate, self.adam_betas, self.mb, self.vb, self.dbias, self.t)
+        else:
+            self.weights -= learning_rate * self.dW
+            self.bias -= learning_rate * self.dbias
+        self.t += 1
 
 
 class LayerNorm:
@@ -333,6 +350,7 @@ class LayerNorm:
         bn_gain: Optional[torch.Tensor],
         bn_bias: Optional[torch.Tensor],
         layer_size: Optional[int] = None,
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
         if bn_bias is not None:
@@ -343,6 +361,14 @@ class LayerNorm:
         self.x_hat = None  # Used in backprop
         self.d_bias = None
         self.d_gain = None
+        self.t = 0  # Time step
+
+        # Gradient optimization values iff adam_betas is not None
+        self.adam_betas = adam_betas
+        self.mgain = torch.zeros_like(self.bn_gain).to(device)
+        self.mbias = torch.zeros(self.bn_bias).to(device)
+        self.vgain = torch.zeros_like(self.bn_gain).to(device)
+        self.vbias = torch.zeros_like(self.bn_bias).to(device)
 
     def forward(
         self,
@@ -354,9 +380,7 @@ class LayerNorm:
         bn_diff_sq = self.bn_diff**2  # B*T*C
         self.bn_var = (1.0 / (z.shape[2])) * bn_diff_sq.sum(2, keepdim=True)  # 32x1
 
-        bn_var_inv = (
-            self.bn_var + 1e-5
-        ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+        bn_var_inv = (self.bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
         self.x_hat = self.bn_diff * bn_var_inv  # 32x1000
         preact = self.x_hat * self.bn_gain + self.bn_bias  # 32x1000
         return preact
@@ -366,9 +390,7 @@ class LayerNorm:
         assert self.x_hat is not None
         layer_size = doutput.shape[2]
 
-        bn_var_inv = (
-            self.bn_var + 1e-5
-        ) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
+        bn_var_inv = (self.bn_var + 1e-5) ** -0.5  # This is 1/sqrt(var + epsilon)  #32x1
 
         d_xhatdL = self.bn_gain * d_preact
         d_bnvarinvdL = (self.bn_diff * d_xhatdL).sum(2, keepdim=True)
@@ -398,8 +420,17 @@ class LayerNorm:
         return d_z
 
     def apply_gradient(self, learning_rate: float):
-        self.bn_gain -= learning_rate * self.d_gain
-        self.bn_bias -= learning_rate * self.d_bias
+        if self.adam_betas is not None:
+            self.bn_gain -= adam_update(
+                learning_rate, self.adam_betas, self.mgain, self.vgain, self.d_gain, self.t
+            )
+            self.bn_bias -= adam_update(
+                learning_rate, self.adam_betas, self.mbias, self.vbias, self.d_bias, self.t
+            )
+        else:
+            self.bn_gain -= learning_rate * self.d_gain
+            self.bn_bias -= learning_rate * self.d_bias
+        self.t += 1
 
 
 class BatchNorm:
@@ -409,6 +440,7 @@ class BatchNorm:
         bn_bias: Optional[torch.Tensor],
         momentum: float,
         layer_size: Optional[int] = None,
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         assert (bn_gain is None) == (bn_bias is None) == (layer_size is not None)
         self.momentum = momentum
@@ -423,6 +455,14 @@ class BatchNorm:
         self.x_hat = None  # Used in backprop
         self.d_bias = None
         self.d_gain = None
+        self.t = 0  # Time step
+
+        # Gradient optimization values iff adam_betas is not None
+        self.adam_betas = adam_betas
+        self.mgain = torch.zeros_like(self.bn_gain).to(device)
+        self.mbias = torch.zeros(self.bn_bias).to(device)
+        self.vgain = torch.zeros_like(self.bn_gain).to(device)
+        self.vbias = torch.zeros_like(self.bn_bias).to(device)
 
     def forward(
         self,
@@ -447,12 +487,8 @@ class BatchNorm:
         self.x_hat = x_hat
 
         if training:
-            self.running_mean = (1 - self.momentum) * self.running_mean + (
-                self.momentum * bn_mean
-            )
-            self.running_var = (1 - self.momentum) * self.running_var + (
-                self.momentum * bn_var
-            )
+            self.running_mean = (1 - self.momentum) * self.running_mean + (self.momentum * bn_mean)
+            self.running_var = (1 - self.momentum) * self.running_var + (self.momentum * bn_var)
 
         return preact
 
@@ -479,6 +515,13 @@ class BatchNorm:
         return dz
 
     def apply_gradient(self, learning_rate: float):
+        if self.adam_betas is not None:
+            self.bn_gain -= adam_update(
+                learning_rate, self.adam_betas, self.mgain, self.vgain, self.d_gain, self.t
+            )
+            self.bn_bias -= adam_update(
+                learning_rate, self.adam_betas, self.mbias, self.vbias, self.d_bias, self.t
+            )
         self.bn_gain -= learning_rate * self.d_gain
         self.bn_bias -= learning_rate * self.d_bias
 
@@ -509,38 +552,33 @@ class Dropout:
 
 class Attention:
     def __init__(
-        self, n_embed: int, n_heads: int, dropout: float, ws: Optional[AttentionWeights]
+        self,
+        n_embed: int,
+        n_heads: int,
+        dropout: float,
+        ws: Optional[AttentionWeights],
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         self.x = None
         self.n_embed = n_embed
         self.n_heads = n_heads
         self.inv_sqrt_head_size = 1.0 / math.sqrt(self.n_embed / self.n_heads)
-        self.key_matrix = 2
         # TODO: check the magnitude of these values
         if ws is not None:
-            self.q_map = Linear(
-                ws.q_weight, ws.q_bias, True, n_embed, n_embed, False, None
-            )
-            self.k_map = Linear(
-                ws.k_weight, ws.k_bias, True, n_embed, n_embed, False, None
-            )
-            self.v_map = Linear(
-                ws.v_weight, ws.v_bias, True, n_embed, n_embed, False, None
-            )
+            self.q_map = Linear(ws.q_weight, ws.q_bias, True, n_embed, n_embed, False, None, adam_betas)
+            self.k_map = Linear(ws.k_weight, ws.k_bias, True, n_embed, n_embed, False, None, adam_betas)
+            self.v_map = Linear(ws.v_weight, ws.v_bias, True, n_embed, n_embed, False, None, adam_betas)
             self.proj_map = Linear(
-                ws.proj_weight, ws.proj_bias, True, n_embed, n_embed, False, None
+                ws.proj_weight, ws.proj_bias, True, n_embed, n_embed, False, None, adam_betas
             )
         else:
-            self.q_map = Linear(None, None, True, n_embed, n_embed, False, None)
-            self.k_map = Linear(None, None, True, n_embed, n_embed, False, None)
-            self.v_map = Linear(None, None, True, n_embed, n_embed, False, None)
-            self.proj_map = Linear(None, None, True, n_embed, n_embed, False, None)
+            self.q_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
+            self.k_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
+            self.v_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
+            self.proj_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
 
         self.dropout = Dropout(dropout_prob=dropout)
-
-        self.softmax = Softmax(
-            dimension=3
-        )  # Sum over the keys dimension (last dimension in masked)
+        self.softmax = Softmax(dimension=3)  # Sum over the keys dimension (last dimension in masked)
 
     def split_heads(self, qk: torch.Tensor) -> torch.Tensor:
         # input is B,T,C output is B,nh,T,hs
@@ -558,49 +596,30 @@ class Attention:
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
-        start_t = time.time()
-        self.x  = x
-        print(f"\t\tA1: {time.time() - start_t}")
+        self.x = x
         q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
-        print(f"\t\tA1: {time.time() - start_t}")
-        k = self.split_heads(self.k_map.forward(x, training)).transpose(
-            -2, -1
-        )  # B,nh,hs,T
-        print(f"\t\tA1: {time.time() - start_t}")
+        k = self.split_heads(self.k_map.forward(x, training)).transpose(-2, -1)  # B,nh,hs,T
         v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        print(f"\t\tA2: {time.time() - start_t}")
         self.dot_prods2 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
-        print(f"\t\tA3: {time.time() - start_t}")
         # del q, k
         mask = torch.ones_like(self.dot_prods2).tril()
-        print(f"\t\tA4: {time.time() - start_t}")
 
         self.dot_prods2.masked_fill_(mask == 0, float("-inf"))
-        print(f"\t\tA5: {time.time() - start_t}")
         # del mask
 
         attention0 = self.softmax.forward(self.dot_prods2, training)
-        print(f"\t\tA6: {time.time() - start_t}")
         self.attention1 = self.dropout.forward(attention0, training)
-        print(f"\t\tA7: {time.time() - start_t}")
         attention0 = self.attention1 @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
-        print(f"\t\tA8: {time.time() - start_t}")
         attention0 = (
             attention0.transpose(1, 2)
             .contiguous()
             .view(attention0.shape[0], attention0.shape[2], self.n_embed)
         )  # B,T,C
-        print(f"\t\tA9: {time.time() - start_t}")
 
-        deltas = self.proj_map.forward(
-            attention0, training
-        )  # Still BTC, but now with the correct values
-        print(f"\t\tA10: {time.time() - start_t}")
+        deltas = self.proj_map.forward(attention0, training)  # Still BTC, but now with the correct values
         del attention0, mask, q, k, v
-        print(f"\t\tA11: {time.time() - start_t}")
         if device == "cuda":
             torch.cuda.empty_cache()
-        print(f"\t\tA12: {time.time() - start_t}")
 
         return deltas
 
@@ -614,9 +633,7 @@ class Attention:
         ).transpose(1, 2)
 
         q = self.split_heads(self.q_map.forward_no_cache(self.x))  # B,nh,T,hs
-        k = self.split_heads(self.k_map.forward_no_cache(self.x)).transpose(
-            -2, -1
-        )  # B,nh,hs,T
+        k = self.split_heads(self.k_map.forward_no_cache(self.x)).transpose(-2, -1)  # B,nh,hs,T
         v = self.split_heads(self.v_map.forward_no_cache(self.x))  # B,nh,T,hs
 
         dattention1 = dattention2 @ v.transpose(-2, -1)
@@ -648,8 +665,9 @@ class Attention:
         return dx
 
     def apply_gradient(self, learning_rate: float):
-        self.proj_map.apply_gradient(learning_rate)
+        # ALl these subfunctions implement Adam so don't need to implement here
         self.dropout.apply_gradient(learning_rate)
+        self.proj_map.apply_gradient(learning_rate)
         self.q_map.apply_gradient(learning_rate)
         self.k_map.apply_gradient(learning_rate)
         self.v_map.apply_gradient(learning_rate)
@@ -662,31 +680,32 @@ class TransformerBlock:
         n_heads: int,
         dropout: float,
         transformer_weights: Optional[TransformerWeights],
+        adam_betas: Optional[Tuple[float, float]] = None,
     ):
         if transformer_weights is None:
             self.attention_section = [
-                LayerNorm(None, None, n_embed),
-                Attention(n_embed, n_heads, dropout, None),
+                LayerNorm(None, None, n_embed, adam_betas),
+                Attention(n_embed, n_heads, dropout, None, adam_betas),
                 Dropout(dropout),
             ]
             self.MLP_section = [
-                LayerNorm(None, None, n_embed),
-                Linear(None, None, True, n_embed, n_embed * 4, True),
+                LayerNorm(None, None, n_embed, adam_betas),
+                Linear(None, None, True, n_embed, n_embed * 4, True, None, adam_betas),
                 Gelu(),
-                Linear(None, None, True, n_embed * 4, n_embed, True),
+                Linear(None, None, True, n_embed * 4, n_embed, True, None, adam_betas),
                 Dropout(dropout),
             ]
         else:
             self.attention_section = [
                 LayerNorm(
-                    transformer_weights.ln_1_weight, transformer_weights.ln_1_bias, None
+                    transformer_weights.ln_1_weight, transformer_weights.ln_1_bias, None, adam_betas
                 ),
-                Attention(n_embed, n_heads, dropout, transformer_weights.attention),
+                Attention(n_embed, n_heads, dropout, transformer_weights.attention, adam_betas),
                 Dropout(dropout),
             ]
             self.MLP_section = [
                 LayerNorm(
-                    transformer_weights.ln_2_weight, transformer_weights.ln_2_bias, None
+                    transformer_weights.ln_2_weight, transformer_weights.ln_2_bias, None, adam_betas
                 ),
                 Linear(
                     transformer_weights.mlp.fc_weight,
@@ -695,6 +714,8 @@ class TransformerBlock:
                     n_embed,
                     n_embed * 4,
                     False,
+                    None,
+                    adam_betas,
                 ),
                 Gelu(),
                 Linear(
@@ -704,26 +725,22 @@ class TransformerBlock:
                     n_embed * 4,
                     n_embed,
                     False,
+                    None,
+                    adam_betas,
                 ),
                 Dropout(dropout),
             ]
 
     def forward(self, x0: torch.Tensor, training: bool):
-        start_t = time.time()
-        print(f"\tT1: {time.time() - start_t}")
         inter0: torch.Tensor = x0
         for layer in self.attention_section:
             inter0 = layer.forward(inter0, training)
-            print(f"\tT2: {time.time() - start_t}")
             torch.cuda.empty_cache()
 
         x1 = inter0 + x0
-        print(f"\tT3: {time.time() - start_t}")
         inter1 = x1
-        print(f"\tT4: {time.time() - start_t}")
         for layer in self.MLP_section:
             inter1 = layer.forward(inter1, training)
-            print(f"\tT5: {time.time() - start_t}")
             torch.cuda.empty_cache()
 
         return inter1 + x1
