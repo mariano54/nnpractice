@@ -7,12 +7,7 @@ import torch
 from src.gpt2_weights import GPT2Weights, TransformerWeights, AttentionWeights
 from src.random_weights import linear_rw, layer_batch_norm_rw
 
-device = "cuda"
-# device = (
-#     "cuda"
-#     if torch.cuda.is_available()
-#     else "mps" if torch.backends.mps.is_available() else "cpu"
-# )
+device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 print(f"Using {device} device")
 
 
@@ -53,11 +48,10 @@ class GPT2Model:
         self.xs = None
         self.vocab_size = vocab_size
         assert int(C / n_heads) == C / n_heads
-
         self.initial_dropout = Dropout(dropout)
         if weights is None:
             n_layers = 12
-            std = 1 / math.sqrt(C)
+            std = 0.02
             self.token_embeddings = torch.normal(0, std, (vocab_size, C)).to(device)
             self.positional_embeddings = torch.normal(0, std, (T, C)).to(device)
             self.transformer_blocks = [
@@ -65,6 +59,7 @@ class GPT2Model:
                     n_embed=C,
                     n_heads=n_heads,
                     dropout=dropout,
+                    num_layers=n_layers,
                     transformer_weights=None,
                     adam_betas=adam_betas,
                 )
@@ -81,6 +76,7 @@ class GPT2Model:
                     n_embed=C,
                     n_heads=n_heads,
                     dropout=dropout,
+                    num_layers=n_layers,
                     transformer_weights=weights.transformer[i],
                     adam_betas=adam_betas,
                 )
@@ -124,17 +120,15 @@ class GPT2Model:
 
         filtered_start = self.initial_dropout.forward(start, True)
         inter0 = filtered_start
-        self.all_transformer_inters = []
         for block in self.transformer_blocks:
             inter0 = block.forward(inter0, True)
-            self.all_transformer_inters.append(inter0)
-        self.inter0 = inter0
-        self.inter = self.final_ln.forward(inter0, True)
+            torch.cuda.empty_cache()
+        inter0 = self.final_ln.forward(inter0, True)
 
         if ys is not None:
-            self.pre_lm_head = self.inter.view((self.B * self.T), C)  # B*T training examples
-            self.logits = self.pre_lm_head @ self.lm_head.T
-            self.final_softmax.forward(self.logits, ys is not None)
+            self.pre_lm_head = inter0.view((self.B * self.T), C)  # B*T training examples
+            logits = self.pre_lm_head @ self.lm_head.T
+            self.final_softmax.forward(logits, ys is not None)
             loss = -torch.mean(
                 torch.log(
                     self.final_softmax.probs[
@@ -149,7 +143,7 @@ class GPT2Model:
             )
         else:
             assert topk is not None
-            logits = (self.inter[:, -1, :] @ self.lm_head.T) / temperature
+            logits = (inter0[:, -1, :] @ self.lm_head.T) / temperature
             vals, _ = torch.topk(logits, topk, 1)
             logits[logits < vals[:, [-1]]] = float("-inf")
             self.final_softmax.forward(logits, ys is not None)
@@ -178,6 +172,8 @@ class GPT2Model:
 
         doutput = dpre_lm_head.view(self.B, self.T, self.C)
         doutput = self.final_ln.backward(doutput)
+        del self.pre_lm_head
+        torch.cuda.empty_cache()
 
         for block in reversed(self.transformer_blocks):
             doutput = block.backward(doutput)
@@ -237,6 +233,7 @@ class Relu:
         d_activations = doutput
         dpreact_template = torch.zeros_like(doutput)
         over_zero = torch.nonzero(self.last_preacts > 0, as_tuple=False)
+        del self.last_preacts
         dpreact_template[over_zero[:, 0], over_zero[:, 1]] = 1
         return dpreact_template * d_activations
 
@@ -263,6 +260,7 @@ class Gelu:
             + last_phi
             + self.last_x * math.sqrt(2 / math.pi) * (1 + 0.13145 * self.last_x**2) * (1 - last_phi**2)
         )
+        del self.last_x
         return dgelu * doutput
 
     def apply_gradient(self, learning_rate: float):
@@ -275,13 +273,14 @@ class Softmax:
         self.dimension = dimension
 
     def forward(self, x: torch.Tensor, training: bool) -> torch.Tensor:
-        x2 = x - torch.max(x, dim=self.dimension, keepdim=True).values
+        x -= torch.max(x, dim=self.dimension, keepdim=True).values
         # exps = torch.exp(x)
-        x3 = x2.exp()
-        denominators = torch.sum(x3, dim=self.dimension, keepdim=True)
+        x.exp_()
+        denominators = torch.sum(x, dim=self.dimension, keepdim=True)
 
         # probs = (x / denominators)
-        self.probs = x3.div(denominators)
+        x.div_(denominators)
+        self.probs = x
         return self.probs
 
     def backward_cross_entropy(self, labels: torch.Tensor) -> torch.Tensor:
@@ -290,17 +289,14 @@ class Softmax:
         for i in range(n):
             d_logits[i][labels[i]] -= 1
         # d_logits[range(n), labels] -= 1
+        del self.probs
         return d_logits / n
 
-    def backward(self, doutput: torch.Tensor, answer) -> torch.Tensor:
+    def backward(self, doutput: torch.Tensor) -> torch.Tensor:
         doutput -= torch.sum(doutput * self.probs, dim=self.dimension, keepdim=True)
-        dlogits = doutput * self.probs
-        # probs_extended = self.probs.unsqueeze(2)
-        # jacobian = torch.diagflat(self.probs) - torch.matmul(
-        #     probs_extended, probs_extended.transpose(-2, -1)
-        # )
-        # dlogits = jacobian.t() @ doutput
-        return dlogits
+        doutput *= self.probs
+        del self.probs
+        return doutput
 
     def apply_gradient(self, learning_rate: float):
         pass
@@ -317,6 +313,7 @@ class Linear:
         zero_biases: bool = False,
         residual_scaling_num_layers: Optional[int] = None,
         adam_betas: Optional[Tuple[float, float]] = None,
+        std_dev: Optional[float] = None,
     ):
         assert (weights is not None) == (bias is not None)
         if weights is not None:
@@ -324,7 +321,7 @@ class Linear:
             self.bias = bias
         else:
             self.weights, self.bias = linear_rw(
-                input_dim, output_dim, zero_biases, residual_scaling_num_layers, device
+                input_dim, output_dim, zero_biases, residual_scaling_num_layers, device, std_dev=std_dev
             )
         self.last_inputs = None
         self.dW = None
@@ -350,6 +347,7 @@ class Linear:
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
         last_inputs_reshaped = self.last_inputs.reshape(-1, self.last_inputs.shape[-1]).T
+        del self.last_inputs
         self.dW = last_inputs_reshaped @ doutput.reshape(-1, doutput.shape[-1])
         self.dbias = doutput.sum((0, 1))
         if self.compute_dx:
@@ -445,7 +443,7 @@ class LayerNorm:
         #         - self.x_hat * (d_preact * self.x_hat).sum(0)
         #     )
         # )
-
+        del self.bn_var, self.bn_diff, self.x_hat
         return d_z
 
     def apply_gradient(self, learning_rate: float):
@@ -580,6 +578,7 @@ class Dropout:
             return doutput
         assert self.dropout_tensor is not None
         dx = doutput * self.dropout_tensor * (1 / (1 - self.dropout_prob))
+        del self.dropout_tensor
         return dx
 
     def apply_gradient(self, learning_rate: float):
@@ -592,6 +591,7 @@ class Attention:
         n_embed: int,
         n_heads: int,
         dropout: float,
+        num_layers: int,
         ws: Optional[AttentionWeights],
         adam_betas: Optional[Tuple[float, float]] = None,
     ):
@@ -608,10 +608,12 @@ class Attention:
                 ws.proj_weight, ws.proj_bias, True, n_embed, n_embed, False, None, adam_betas
             )
         else:
-            self.q_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
-            self.k_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
-            self.v_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
-            self.proj_map = Linear(None, None, True, n_embed, n_embed, False, None, adam_betas)
+            self.q_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.k_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.v_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.proj_map = Linear(
+                None, None, True, n_embed, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
+            )
 
         self.dropout = Dropout(dropout_prob=dropout)
         self.softmax = Softmax(dimension=3)  # Sum over the keys dimension (last dimension in masked)
@@ -632,20 +634,22 @@ class Attention:
         # X is B, T, C tensor
         # each C tensor should be multiplied by a K and V matrix, resulting in a C sized K or V vector
         # to B,T,C @ C,C matrix
-        self.x = x
         q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
         k = self.split_heads(self.k_map.forward(x, training)).transpose(-2, -1)  # B,nh,hs,T
         v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
-        self.dot_prods2 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
-        # del q, k
-        mask = torch.ones_like(self.dot_prods2).tril()
+        self.v = v
+        dot_prods2 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
+        del q, k
+        mask = torch.ones_like(dot_prods2).tril()
 
-        self.dot_prods2.masked_fill_(mask == 0, float("-inf"))
-        # del mask
+        dot_prods2.masked_fill_(mask == 0, float("-inf"))
+        del mask
 
-        attention0 = self.softmax.forward(self.dot_prods2, training)
+        attention0 = self.softmax.forward(dot_prods2, training)
+        del dot_prods2
         self.attention1 = self.dropout.forward(attention0, training)
         attention0 = self.attention1 @ v  # B,nh,TT x B,nh,T,hs ->  B,nh,T,hs
+        del v
         attention0 = (
             attention0.transpose(1, 2)
             .contiguous()
@@ -653,10 +657,11 @@ class Attention:
         )  # B,T,C
 
         deltas = self.proj_map.forward(attention0, training)  # Still BTC, but now with the correct values
-        del attention0, mask, q, k, v
+        del attention0
         if device == "cuda":
             torch.cuda.empty_cache()
 
+        self.x = x
         return deltas
 
     def backward(self, ddeltas: torch.Tensor) -> torch.Tensor:
@@ -670,12 +675,17 @@ class Attention:
 
         q = self.split_heads(self.q_map.forward_no_cache(self.x))  # B,nh,T,hs
         k = self.split_heads(self.k_map.forward_no_cache(self.x)).transpose(-2, -1)  # B,nh,hs,T
-        v = self.split_heads(self.v_map.forward_no_cache(self.x))  # B,nh,T,hs
+        del self.x
 
-        dattention1 = dattention2 @ v.transpose(-2, -1)
+        dattention1 = dattention2 @ self.v.transpose(-2, -1)
+        del self.v
         dv = self.attention1.transpose(-2, -1) @ dattention2
         dattention0 = self.dropout.backward(dattention1)
-        ddot_prods = self.softmax.backward(dattention0, self.dot_prods2.grad)
+        del dattention1, dattention2, dattention3, ddeltas
+        torch.cuda.empty_cache()
+        ddot_prods = self.softmax.backward(dattention0)
+        del dattention0
+        torch.cuda.empty_cache()
 
         # Grads should not flow where mask == 0
         mask = torch.ones_like(ddot_prods).tril()
@@ -695,6 +705,7 @@ class Attention:
         dx1 = self.v_map.backward(dv)
         dx2 = self.k_map.backward(dk)
         dx3 = self.q_map.backward(dq)
+        del self.attention1
 
         dx = dx1 + dx2 + dx3
 
@@ -715,20 +726,23 @@ class TransformerBlock:
         n_embed: int,
         n_heads: int,
         dropout: float,
+        num_layers: int,
         transformer_weights: Optional[TransformerWeights],
         adam_betas: Optional[Tuple[float, float]] = None,
     ):
         if transformer_weights is None:
             self.attention_section = [
                 LayerNorm(None, None, n_embed, adam_betas),
-                Attention(n_embed, n_heads, dropout, None, adam_betas),
+                Attention(n_embed, n_heads, dropout, num_layers, None, adam_betas),
                 Dropout(dropout),
             ]
             self.MLP_section = [
                 LayerNorm(None, None, n_embed, adam_betas),
-                Linear(None, None, True, n_embed, n_embed * 4, True, None, adam_betas),
+                Linear(None, None, True, n_embed, n_embed * 4, True, None, adam_betas, std_dev=0.02),
                 Gelu(),
-                Linear(None, None, True, n_embed * 4, n_embed, True, None, adam_betas),
+                Linear(
+                    None, None, True, n_embed * 4, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
+                ),
                 Dropout(dropout),
             ]
         else:
@@ -736,7 +750,9 @@ class TransformerBlock:
                 LayerNorm(
                     transformer_weights.ln_1_weight, transformer_weights.ln_1_bias, None, adam_betas
                 ),
-                Attention(n_embed, n_heads, dropout, transformer_weights.attention, adam_betas),
+                Attention(
+                    n_embed, n_heads, dropout, num_layers, transformer_weights.attention, adam_betas
+                ),
                 Dropout(dropout),
             ]
             self.MLP_section = [
@@ -782,24 +798,19 @@ class TransformerBlock:
         return inter1 + x1
 
     def backward(self, dx3: torch.Tensor) -> torch.Tensor:
-        dinter6 = dx3
-        dinters = [dinter6]
-        dx1 = dx3
-
+        dinter = dx3
         for layer in reversed(self.MLP_section):
-            dinters.append(layer.backward(dinters[-1]))
+            dinter = layer.backward(dinter)
 
-        dx1 += dinters[-1]
+        dx3 += dinter
 
-        dinter03 = dx1
-        dx0 = dx1
+        dinter = dx3.clone()
 
-        dinter02 = self.attention_section[2].backward(dinter03)
-        dinter01 = self.attention_section[1].backward(dinter02)
-        dinter0 = self.attention_section[0].backward(dinter01)
+        dinter = self.attention_section[2].backward(dinter)
+        dinter = self.attention_section[1].backward(dinter)
+        dinter = self.attention_section[0].backward(dinter)
 
-        dx0 += dinter0
-        return dx0
+        return dx3 + dinter
 
     def apply_gradient(self, learning_rate: float):
         for layer in reversed(self.MLP_section):
