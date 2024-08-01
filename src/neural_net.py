@@ -23,12 +23,12 @@ def adam_update(
     v: torch.tensor,
     deriv: torch.tensor,  # Gradients
     t: int,
-) -> torch.tensor:
+) -> Tuple[torch.tensor, torch.tensor, torch.tensor]:
     new_mw = betas[0] * m + (1 - betas[0]) * deriv
-    new_mw_corr = new_mw / (1 - betas[0] ** t)
-    new_vw = betas[1] * v + (1 - betas[1]) * (deriv * 2)
-    new_vw_corr = new_vw / (1 - betas[1] ** t)
-    return learning_rate * new_mw_corr / (torch.sqrt(new_vw_corr) + 10e-8)
+    new_mw_corr = new_mw / (1 - betas[0] ** (t + 1))
+    new_vw = betas[1] * v + (1 - betas[1]) * (deriv**2)
+    new_vw_corr = new_vw / (1 - betas[1] ** (t + 1))
+    return learning_rate * new_mw_corr / (torch.sqrt(new_vw_corr) + 10e-8), new_mw, new_vw
 
 
 class GPT2Model:
@@ -93,6 +93,15 @@ class GPT2Model:
             self.lm_head = weights.wte
 
         self.final_softmax = Softmax()
+        self.t = 0  # Time step
+
+        # Gradient optimization values iff adam_betas is not None
+        self.adam_betas = adam_betas
+        if adam_betas is not None:
+            self.mt = torch.zeros_like(self.token_embeddings).to(device)
+            self.mp = torch.zeros_like(self.positional_embeddings).to(device)
+            self.vt = torch.zeros_like(self.token_embeddings).to(device)
+            self.vp = torch.zeros_like(self.positional_embeddings).to(device)
 
     def forward(
         self,
@@ -197,8 +206,20 @@ class GPT2Model:
         for layer in reversed(self.transformer_blocks):
             layer.apply_gradient(learning_rate)
         self.initial_dropout.apply_gradient(learning_rate)
-        self.token_embeddings -= self.dtoken_embeddings * learning_rate
-        self.positional_embeddings -= self.dpos_embeddings * learning_rate
+        if self.adam_betas is not None:
+            update, self.mt, self.vt = adam_update(
+                learning_rate, self.adam_betas, self.mt, self.vt, self.dtoken_embeddings, self.t
+            )
+            self.token_embeddings -= update
+            update, self.mp, self.vp = adam_update(
+                learning_rate, self.adam_betas, self.mp, self.vp, self.dpos_embeddings, self.t
+            )
+            self.positional_embeddings -= update
+        else:
+            self.token_embeddings -= self.dtoken_embeddings * learning_rate
+            self.positional_embeddings -= self.dpos_embeddings * learning_rate
+
+        self.t += 1
 
     def get_weights(self) -> GPT2Weights:
         pass
@@ -313,10 +334,11 @@ class Linear:
 
         # Gradient optimization values iff adam_betas is not None
         self.adam_betas = adam_betas
-        self.mw = torch.zeros_like(self.weights).to(device)
-        self.mb = torch.zeros(self.bias).to(device)
-        self.vw = torch.zeros_like(self.weights).to(device)
-        self.vb = torch.zeros_like(self.bias).to(device)
+        if adam_betas is not None:
+            self.mw = torch.zeros_like(self.weights).to(device)
+            self.mb = torch.zeros_like(self.bias).to(device)
+            self.vw = torch.zeros_like(self.weights).to(device)
+            self.vb = torch.zeros_like(self.bias).to(device)
 
     def forward(self, xs: torch.Tensor, training: bool) -> torch.Tensor:
         self.last_inputs = xs
@@ -336,8 +358,14 @@ class Linear:
 
     def apply_gradient(self, learning_rate: float):
         if self.adam_betas is not None:
-            self.weights -= adam_update(learning_rate, self.adam_betas, self.mw, self.vw, self.dW, self.t)
-            self.bias -= adam_update(learning_rate, self.adam_betas, self.mb, self.vb, self.dbias, self.t)
+            update, self.mw, self.vw = adam_update(
+                learning_rate, self.adam_betas, self.mw, self.vw, self.dW, self.t
+            )
+            self.weights -= update
+            update, self.mb, self.vb = adam_update(
+                learning_rate, self.adam_betas, self.mb, self.vb, self.dbias, self.t
+            )
+            self.bias -= update
         else:
             self.weights -= learning_rate * self.dW
             self.bias -= learning_rate * self.dbias
@@ -365,10 +393,11 @@ class LayerNorm:
 
         # Gradient optimization values iff adam_betas is not None
         self.adam_betas = adam_betas
-        self.mgain = torch.zeros_like(self.bn_gain).to(device)
-        self.mbias = torch.zeros(self.bn_bias).to(device)
-        self.vgain = torch.zeros_like(self.bn_gain).to(device)
-        self.vbias = torch.zeros_like(self.bn_bias).to(device)
+        if self.adam_betas is not None:
+            self.mgain = torch.zeros_like(self.bn_gain).to(device)
+            self.mbias = torch.zeros_like(self.bn_bias).to(device)
+            self.vgain = torch.zeros_like(self.bn_gain).to(device)
+            self.vbias = torch.zeros_like(self.bn_bias).to(device)
 
     def forward(
         self,
@@ -421,12 +450,15 @@ class LayerNorm:
 
     def apply_gradient(self, learning_rate: float):
         if self.adam_betas is not None:
-            self.bn_gain -= adam_update(
+            update, self.mgain, self.vgain = adam_update(
                 learning_rate, self.adam_betas, self.mgain, self.vgain, self.d_gain, self.t
             )
-            self.bn_bias -= adam_update(
+            self.bn_gain -= update
+            update, self.mbias, self.vbias = adam_update(
                 learning_rate, self.adam_betas, self.mbias, self.vbias, self.d_bias, self.t
             )
+            self.bn_bias -= update
+
         else:
             self.bn_gain -= learning_rate * self.d_gain
             self.bn_bias -= learning_rate * self.d_bias
@@ -459,10 +491,11 @@ class BatchNorm:
 
         # Gradient optimization values iff adam_betas is not None
         self.adam_betas = adam_betas
-        self.mgain = torch.zeros_like(self.bn_gain).to(device)
-        self.mbias = torch.zeros(self.bn_bias).to(device)
-        self.vgain = torch.zeros_like(self.bn_gain).to(device)
-        self.vbias = torch.zeros_like(self.bn_bias).to(device)
+        if self.adam_betas is not None:
+            self.mgain = torch.zeros_like(self.bn_gain).to(device)
+            self.mbias = torch.zeros(self.bn_bias).to(device)
+            self.vgain = torch.zeros_like(self.bn_gain).to(device)
+            self.vbias = torch.zeros_like(self.bn_bias).to(device)
 
     def forward(
         self,
@@ -516,14 +549,17 @@ class BatchNorm:
 
     def apply_gradient(self, learning_rate: float):
         if self.adam_betas is not None:
-            self.bn_gain -= adam_update(
+            update, self.mgain, self.vgain = adam_update(
                 learning_rate, self.adam_betas, self.mgain, self.vgain, self.d_gain, self.t
             )
-            self.bn_bias -= adam_update(
+            self.bn_gain -= update
+            update, self.mbias, self.vbias = adam_update(
                 learning_rate, self.adam_betas, self.mbias, self.vbias, self.d_bias, self.t
             )
-        self.bn_gain -= learning_rate * self.d_gain
-        self.bn_bias -= learning_rate * self.d_bias
+            self.bn_bias -= update
+        else:
+            self.bn_gain -= learning_rate * self.d_gain
+            self.bn_bias -= learning_rate * self.d_bias
 
 
 class Dropout:

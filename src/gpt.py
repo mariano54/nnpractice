@@ -13,9 +13,7 @@ device = "cuda"
 torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
 torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
 dtype = (
-    "bfloat16"
-    if torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-    else "float16"
+    "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
 )  # 'float32' or 'bfloat16' or 'float16'
 device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
 ptdtype = {
@@ -24,9 +22,7 @@ ptdtype = {
     "float16": torch.float16,
 }[dtype]
 ctx = (
-    nullcontext()
-    if device_type == "cpu"
-    else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
+    nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 from src.tokenization import GPT2Tokenizer
 
@@ -47,9 +43,7 @@ def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
 from src.neural_net import GPT2Model, device
 
 
-def get_batch_consecutive(
-    dataset: torch.tensor, block_size: int, batch_size: int, index_start: int
-):
+def get_batch_consecutive(dataset: torch.tensor, block_size: int, batch_size: int, index_start: int):
     xs = []
     ys = []
     for i in range(batch_size):
@@ -78,9 +72,7 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     dropout = 0.0
     topk = 200
     # with ctx:
-    llm = GPT2Model(
-        weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout
-    )
+    llm = GPT2Model(weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout)
     first_encoding = torch.tensor(
         [
             gpt2_tokenizer.encode("I am very curious about"),
@@ -88,6 +80,7 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
         ],
         dtype=torch.long,
     ).to(device)
+
     new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
     results = []
     for i in range(new_tokens.shape[0]):
@@ -119,27 +112,23 @@ def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     torch.manual_seed(100)
     losses = []
     for _ in range(10):
-        random_index = torch.randint(
-            0, len(dataset) - (llm.max_B * llm.max_T) - 1, (1,)
-        ).item()
+        random_index = torch.randint(0, len(dataset) - (llm.max_B * llm.max_T) - 1, (1,)).item()
         xs, ys = get_batch_consecutive(dataset, llm.max_T, llm.max_B, random_index)
         probs, loss = llm.forward(xs, ys)
-        losses.append(
-            loss * probs.shape[0] / llm.max_B
-        )  # Normalize for the final batch (maybe smaller)
+        losses.append(loss * probs.shape[0] / llm.max_B)  # Normalize for the final batch (maybe smaller)
     return torch.tensor(losses).mean().item()
 
 
 def train(llm: GPT2Model, dataset: List[int]):
-    step_size = 0.003
+    step_size = 0.0003
     train_up_to = int(len(dataset) * 0.8)
     train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
     train_set = torch.tensor(train_set, dtype=torch.int32).to(device)
     test_set = torch.tensor(test_set, dtype=torch.int32).to(device)
 
     torch.manual_seed(100)
+    xs, ys = get_batch(train_set, llm.max_T, llm.max_B)
     for i in range(10000):
-        xs, ys = get_batch(train_set, llm.max_T, llm.max_B)
         _, loss = llm.forward(xs, ys)
         print(f"Loss at {i}= {loss}")
         llm.backward(ys)
@@ -176,16 +165,16 @@ def main():
     test_forward_backward(gpt2_tokenizer, encoded_dataset)
 
     batch_size = 8
-    block_size = 512
+    block_size = 32
     emb_dimension = 768
     vocab_size = 50257
     n_heads = 12
     dropout = 0.0
+    # adam_betas = (0.9, 0.999)
+    adam_betas = None
 
     # with ctx:
-    llm = GPT2Model(
-        None, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout
-    )
+    llm = GPT2Model(None, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout, adam_betas)
     train(llm, dataset=encoded_dataset)
 
     # first_encoding = torch.tensor(
