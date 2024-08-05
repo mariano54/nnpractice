@@ -23,7 +23,7 @@ def adam_update(
     new_mw_corr = new_mw / (1 - betas[0] ** (t + 1))
     new_vw = betas[1] * v + (1 - betas[1]) * (deriv**2)
     new_vw_corr = new_vw / (1 - betas[1] ** (t + 1))
-    return learning_rate * new_mw_corr / (torch.sqrt(new_vw_corr) + 10e-8), new_mw, new_vw
+    return learning_rate * new_mw_corr / (torch.sqrt(new_vw_corr) + 1e-8), new_mw, new_vw
 
 
 class GPT2Model:
@@ -36,6 +36,7 @@ class GPT2Model:
         vocab_size: int,
         n_heads: int,
         dropout: float,
+        weight_decay: float,
         adam_betas: Optional[Tuple[float, float]] = None,
     ):
         self.dtoken_embeddings = None
@@ -49,6 +50,7 @@ class GPT2Model:
         self.vocab_size = vocab_size
         assert int(C / n_heads) == C / n_heads
         self.initial_dropout = Dropout(dropout)
+        self.weight_decay = weight_decay
         if weights is None:
             n_layers = 12
             std = 0.02
@@ -61,6 +63,7 @@ class GPT2Model:
                     dropout=dropout,
                     num_layers=n_layers,
                     transformer_weights=None,
+                    weight_decay=weight_decay,
                     adam_betas=adam_betas,
                 )
                 for _ in range(n_layers)
@@ -78,6 +81,7 @@ class GPT2Model:
                     dropout=dropout,
                     num_layers=n_layers,
                     transformer_weights=weights.transformer[i],
+                    weight_decay=weight_decay,
                     adam_betas=adam_betas,
                 )
                 for i in range(n_layers)
@@ -99,6 +103,7 @@ class GPT2Model:
             self.vt = torch.zeros_like(self.token_embeddings).to(device)
             self.vp = torch.zeros_like(self.positional_embeddings).to(device)
 
+    # @torch.compile
     def forward(
         self,
         xs: torch.Tensor,
@@ -122,7 +127,6 @@ class GPT2Model:
         inter0 = filtered_start
         for block in self.transformer_blocks:
             inter0 = block.forward(inter0, True)
-            torch.cuda.empty_cache()
         inter0 = self.final_ln.forward(inter0, True)
 
         if ys is not None:
@@ -173,7 +177,6 @@ class GPT2Model:
         doutput = dpre_lm_head.view(self.B, self.T, self.C)
         doutput = self.final_ln.backward(doutput)
         del self.pre_lm_head
-        torch.cuda.empty_cache()
 
         for block in reversed(self.transformer_blocks):
             doutput = block.backward(doutput)
@@ -199,8 +202,12 @@ class GPT2Model:
         self.dtoken_embeddings += dlm_head_w.T
 
     def apply_gradient(self, learning_rate: float) -> None:
+        self.final_ln.apply_gradient(learning_rate)
+        # start_t  = time.time()
         for layer in reversed(self.transformer_blocks):
             layer.apply_gradient(learning_rate)
+        # print(f"\tALl layers: {time.time() - start_t}")
+        # start_t  = time.time()
         self.initial_dropout.apply_gradient(learning_rate)
         if self.adam_betas is not None:
             update, self.mt, self.vt = adam_update(
@@ -212,14 +219,38 @@ class GPT2Model:
             )
             self.positional_embeddings -= update
         else:
-            self.token_embeddings -= self.dtoken_embeddings * learning_rate
-            self.positional_embeddings -= self.dpos_embeddings * learning_rate
+            self.token_embeddings -= (learning_rate * (self.dtoken_embeddings + 2 * self.weight_decay * self.token_embeddings))
+            self.positional_embeddings -= (learning_rate * (self.dpos_embeddings + 2 * self.weight_decay * self.positional_embeddings))
 
         self.t += 1
 
     def get_weights(self) -> GPT2Weights:
         pass
 
+    def get_grad_norm(self) -> float:
+        s = torch.sum(self.dpos_embeddings ** 2)
+        s += torch.sum(self.dtoken_embeddings ** 2)
+        s += torch.sum(self.final_ln.d_gain ** 2)
+        s += torch.sum(self.final_ln.d_bias ** 2)
+        for layer in self.transformer_blocks:
+            s += torch.sum(layer.MLP_section[0].d_gain ** 2)
+            s += torch.sum(layer.MLP_section[0].d_bias ** 2)
+            s += torch.sum(layer.MLP_section[1].dW ** 2)
+            s += torch.sum(layer.MLP_section[1].dbias ** 2)
+            s += torch.sum(layer.MLP_section[3].dW ** 2)
+            s += torch.sum(layer.MLP_section[3].dbias ** 2)
+
+            s += torch.sum(layer.attention_section[0].d_gain ** 2)
+            s += torch.sum(layer.attention_section[0].d_bias ** 2)
+            s += torch.sum(layer.attention_section[1].q_map.dW ** 2)
+            s += torch.sum(layer.attention_section[1].q_map.dbias ** 2)
+            s += torch.sum(layer.attention_section[1].k_map.dW ** 2)
+            s += torch.sum(layer.attention_section[1].k_map.dbias ** 2)
+            s += torch.sum(layer.attention_section[1].v_map.dW ** 2)
+            s += torch.sum(layer.attention_section[1].v_map.dbias ** 2)
+            s += torch.sum(layer.attention_section[1].proj_map.dW ** 2)
+            s += torch.sum(layer.attention_section[1].proj_map.dbias ** 2)
+        return torch.sqrt(s).item()
 
 class Relu:
     def __init__(self):
@@ -249,8 +280,6 @@ class Gelu:
         self.last_x = x
         last_phi_plus_1 = 1 + torch.tanh(math.sqrt(2 / math.pi) * (x + 0.044715 * x**3))
         last_phi_plus_1 *= 0.5 * x
-        # del last_phi_plus_1
-        # torch.cuda.empty_cache()
         return last_phi_plus_1
 
     def backward(self, doutput: torch.Tensor) -> torch.Tensor:
@@ -286,9 +315,7 @@ class Softmax:
     def backward_cross_entropy(self, labels: torch.Tensor) -> torch.Tensor:
         n = self.probs.shape[0]
         d_logits = self.probs
-        for i in range(n):
-            d_logits[i][labels[i]] -= 1
-        # d_logits[range(n), labels] -= 1
+        d_logits[torch.arange(n), labels.flatten()] -= 1
         del self.probs
         return d_logits / n
 
@@ -307,6 +334,7 @@ class Linear:
         self,
         weights: Optional[torch.Tensor],
         bias: Optional[torch.Tensor],
+        weight_decay: float,
         compute_dx: bool = True,
         input_dim: Optional[int] = None,
         output_dim: Optional[int] = None,
@@ -327,6 +355,7 @@ class Linear:
         self.dW = None
         self.dbias = None
         self.compute_dx = compute_dx
+        self.weight_decay = weight_decay
         self.t = 0  # Time step
 
         # Gradient optimization values iff adam_betas is not None
@@ -365,7 +394,7 @@ class Linear:
             )
             self.bias -= update
         else:
-            self.weights -= learning_rate * self.dW
+            self.weights -= (learning_rate * (self.dW + 2 * self.weight_decay * self.weights))
             self.bias -= learning_rate * self.dbias
         self.t += 1
 
@@ -412,6 +441,7 @@ class LayerNorm:
         preact = self.x_hat * self.bn_gain + self.bn_bias  # 32x1000
         return preact
 
+    # @torch.compile
     def backward(self, doutput: torch.Tensor):
         d_preact: torch.Tensor = doutput
         assert self.x_hat is not None
@@ -447,6 +477,8 @@ class LayerNorm:
         return d_z
 
     def apply_gradient(self, learning_rate: float):
+        # start_t = time.time()
+
         if self.adam_betas is not None:
             update, self.mgain, self.vgain = adam_update(
                 learning_rate, self.adam_betas, self.mgain, self.vgain, self.d_gain, self.t
@@ -461,6 +493,7 @@ class LayerNorm:
             self.bn_gain -= learning_rate * self.d_gain
             self.bn_bias -= learning_rate * self.d_bias
         self.t += 1
+        # print(f"\t\t LN time: {time.time() - start_t}")
 
 
 class BatchNorm:
@@ -559,7 +592,6 @@ class BatchNorm:
             self.bn_gain -= learning_rate * self.d_gain
             self.bn_bias -= learning_rate * self.d_bias
 
-
 class Dropout:
     def __init__(self, dropout_prob: float):
         self.dropout_prob = dropout_prob
@@ -593,6 +625,7 @@ class Attention:
         dropout: float,
         num_layers: int,
         ws: Optional[AttentionWeights],
+        weight_decay: float,
         adam_betas: Optional[Tuple[float, float]] = None,
     ):
         self.x = None
@@ -601,18 +634,18 @@ class Attention:
         self.inv_sqrt_head_size = 1.0 / math.sqrt(self.n_embed / self.n_heads)
         # TODO: check the magnitude of these values
         if ws is not None:
-            self.q_map = Linear(ws.q_weight, ws.q_bias, True, n_embed, n_embed, False, None, adam_betas)
-            self.k_map = Linear(ws.k_weight, ws.k_bias, True, n_embed, n_embed, False, None, adam_betas)
-            self.v_map = Linear(ws.v_weight, ws.v_bias, True, n_embed, n_embed, False, None, adam_betas)
+            self.q_map = Linear(ws.q_weight, ws.q_bias, weight_decay, True, n_embed, n_embed, False, None, adam_betas)
+            self.k_map = Linear(ws.k_weight, ws.k_bias, weight_decay, True, n_embed, n_embed, False, None, adam_betas)
+            self.v_map = Linear(ws.v_weight, ws.v_bias, weight_decay, True, n_embed, n_embed, False, None, adam_betas)
             self.proj_map = Linear(
-                ws.proj_weight, ws.proj_bias, True, n_embed, n_embed, False, None, adam_betas
+                ws.proj_weight, ws.proj_bias, weight_decay, True, n_embed, n_embed, False, None, adam_betas
             )
         else:
-            self.q_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
-            self.k_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
-            self.v_map = Linear(None, None, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.q_map = Linear(None, None, weight_decay, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.k_map = Linear(None, None, weight_decay, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
+            self.v_map = Linear(None, None, weight_decay, True, n_embed, n_embed, True, None, adam_betas, std_dev=0.02)
             self.proj_map = Linear(
-                None, None, True, n_embed, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
+                None, None, weight_decay, True, n_embed, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
             )
 
         self.dropout = Dropout(dropout_prob=dropout)
@@ -637,6 +670,8 @@ class Attention:
         q = self.split_heads(self.q_map.forward(x, training))  # B,nh,T,hs
         k = self.split_heads(self.k_map.forward(x, training)).transpose(-2, -1)  # B,nh,hs,T
         v = self.split_heads(self.v_map.forward(x, training))  # B,nh,T,hs
+        self.q = q
+        self.k = k
         self.v = v
         dot_prods2 = (q @ k) * self.inv_sqrt_head_size  # B,nh,T,T
         del q, k
@@ -658,12 +693,11 @@ class Attention:
 
         deltas = self.proj_map.forward(attention0, training)  # Still BTC, but now with the correct values
         del attention0
-        if device == "cuda":
-            torch.cuda.empty_cache()
 
         self.x = x
         return deltas
 
+    # @torch.compile
     def backward(self, ddeltas: torch.Tensor) -> torch.Tensor:
         dattention3 = self.proj_map.backward(ddeltas)  # B,T,C
         dattention2 = dattention3.view(
@@ -673,8 +707,8 @@ class Attention:
             int(self.n_embed / self.n_heads),
         ).transpose(1, 2)
 
-        q = self.split_heads(self.q_map.forward_no_cache(self.x))  # B,nh,T,hs
-        k = self.split_heads(self.k_map.forward_no_cache(self.x)).transpose(-2, -1)  # B,nh,hs,T
+        # q = self.split_heads(self.q_map.forward_no_cache(self.x))  # B,nh,T,hs
+        # k = self.split_heads(self.k_map.forward_no_cache(self.x)).transpose(-2, -1)  # B,nh,hs,T
         del self.x
 
         dattention1 = dattention2 @ self.v.transpose(-2, -1)
@@ -682,10 +716,8 @@ class Attention:
         dv = self.attention1.transpose(-2, -1) @ dattention2
         dattention0 = self.dropout.backward(dattention1)
         del dattention1, dattention2, dattention3, ddeltas
-        torch.cuda.empty_cache()
         ddot_prods = self.softmax.backward(dattention0)
         del dattention0
-        torch.cuda.empty_cache()
 
         # Grads should not flow where mask == 0
         mask = torch.ones_like(ddot_prods).tril()
@@ -694,8 +726,8 @@ class Attention:
         # Do the scaling
         ddot_prods *= self.inv_sqrt_head_size
 
-        dq = ddot_prods @ k.transpose(-2, -1)  # B,nh,T,T @ B,nh,T,hs  -> B,nh,T,hs
-        dk = q.transpose(-2, -1) @ ddot_prods
+        dq = ddot_prods @ self.k.transpose(-2, -1)  # B,nh,T,T @ B,nh,T,hs  -> B,nh,T,hs
+        dk = self.q.transpose(-2, -1) @ ddot_prods
 
         # Now we want to unsplit the heads
         dq = self.combine_heads(dq)
@@ -712,12 +744,14 @@ class Attention:
         return dx
 
     def apply_gradient(self, learning_rate: float):
+        # start_t = time.time()
         # ALl these subfunctions implement Adam so don't need to implement here
         self.dropout.apply_gradient(learning_rate)
         self.proj_map.apply_gradient(learning_rate)
         self.q_map.apply_gradient(learning_rate)
         self.k_map.apply_gradient(learning_rate)
         self.v_map.apply_gradient(learning_rate)
+        # print(f"\t\t att time: {time.time() - start_t}")
 
 
 class TransformerBlock:
@@ -728,20 +762,22 @@ class TransformerBlock:
         dropout: float,
         num_layers: int,
         transformer_weights: Optional[TransformerWeights],
+        weight_decay: float,
         adam_betas: Optional[Tuple[float, float]] = None,
+
     ):
         if transformer_weights is None:
             self.attention_section = [
                 LayerNorm(None, None, n_embed, adam_betas),
-                Attention(n_embed, n_heads, dropout, num_layers, None, adam_betas),
+                Attention(n_embed, n_heads, dropout, num_layers, None, weight_decay, adam_betas),
                 Dropout(dropout),
             ]
             self.MLP_section = [
                 LayerNorm(None, None, n_embed, adam_betas),
-                Linear(None, None, True, n_embed, n_embed * 4, True, None, adam_betas, std_dev=0.02),
+                Linear(None, None, weight_decay, True, n_embed, n_embed * 4, True, None, adam_betas, std_dev=0.02),
                 Gelu(),
                 Linear(
-                    None, None, True, n_embed * 4, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
+                    None, None, weight_decay, True, n_embed * 4, n_embed, True, 2 * num_layers, adam_betas, std_dev=0.02
                 ),
                 Dropout(dropout),
             ]
@@ -751,7 +787,7 @@ class TransformerBlock:
                     transformer_weights.ln_1_weight, transformer_weights.ln_1_bias, None, adam_betas
                 ),
                 Attention(
-                    n_embed, n_heads, dropout, num_layers, transformer_weights.attention, adam_betas
+                    n_embed, n_heads, dropout, num_layers, transformer_weights.attention, weight_decay, adam_betas
                 ),
                 Dropout(dropout),
             ]
@@ -762,6 +798,7 @@ class TransformerBlock:
                 Linear(
                     transformer_weights.mlp.fc_weight,
                     transformer_weights.mlp.fc_bias,
+                    weight_decay,
                     True,
                     n_embed,
                     n_embed * 4,
@@ -773,6 +810,7 @@ class TransformerBlock:
                 Linear(
                     transformer_weights.mlp.proj_weight,
                     transformer_weights.mlp.proj_bias,
+                    weight_decay,
                     True,
                     n_embed * 4,
                     n_embed,
@@ -787,21 +825,19 @@ class TransformerBlock:
         inter0: torch.Tensor = x0
         for layer in self.attention_section:
             inter0 = layer.forward(inter0, training)
-            torch.cuda.empty_cache()
 
         x1 = inter0 + x0
         inter1 = x1
         for layer in self.MLP_section:
             inter1 = layer.forward(inter1, training)
-            torch.cuda.empty_cache()
 
         return inter1 + x1
 
+    # @torch.compile
     def backward(self, dx3: torch.Tensor) -> torch.Tensor:
         dinter = dx3
         for layer in reversed(self.MLP_section):
             dinter = layer.backward(dinter)
-
         dx3 += dinter
 
         dinter = dx3.clone()

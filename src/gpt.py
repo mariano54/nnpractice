@@ -1,34 +1,23 @@
 import dataclasses
+import math
 import pickle
 import time
 from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Optional
+import argparse
 
 from src.gpt2_weights import GPT2Weights
+from torch.profiler import profile, record_function, ProfilerActivity
 
 import torch
+from src.torch_settings import ConditionalAutocast, device
 
-device = "cuda"
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
-dtype = (
-    "bfloat16" if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else "float16"
-)  # 'float32' or 'bfloat16' or 'float16'
-device_type = "cuda" if "cuda" in device else "cpu"  # for later use in torch.autocast
-ptdtype = {
-    "float32": torch.float32,
-    "bfloat16": torch.bfloat16,
-    "float16": torch.float16,
-}[dtype]
-print(f"PTDtype: {ptdtype}")
-ctx = (
-    nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
-)
-torch.backends.cuda.matmul.allow_tf32 = True  # allow tf32 on matmul
-torch.backends.cudnn.allow_tf32 = True  # allow tf32 on cudnn
+
 from src.tokenization import GPT2Tokenizer
 
+def to_ms(secs: float) -> int:
+    return int(secs * 1000)
 
 def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
     xs = []
@@ -44,6 +33,18 @@ def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
 
 
 from src.neural_net import GPT2Model, device
+
+
+def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, warmup: int) -> float:
+    # From nanoGPT (Andrej Karpathy)
+    if step_index <= warmup:
+        return max_step_size * (step_index + 1) / warmup
+    if step_index > max_steps:
+        return 0.1 * max_step_size
+
+    proportion_to_end = (step_index - warmup) / (max_steps - warmup)
+    coeff = 0.5 * (1 + math.cos(math.pi * proportion_to_end))
+    return 0.1 * max_step_size + coeff * (0.9 * max_step_size)
 
 
 def get_batch_consecutive(dataset: torch.tensor, block_size: int, batch_size: int, index_start: int):
@@ -74,8 +75,9 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     n_heads = 12
     dropout = 0.0
     topk = 200
+    weight_decay = 0
     # with ctx:
-    llm = GPT2Model(weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout)
+    llm = GPT2Model(weights, batch_size, block_size, emb_dimension, vocab_size, n_heads, weight_decay, dropout)
     first_encoding = torch.tensor(
         [
             gpt2_tokenizer.encode("I am very curious about"),
@@ -122,35 +124,61 @@ def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     return torch.tensor(losses).mean().item()
 
 
+
 def train(llm: GPT2Model, dataset: List[int]):
-    step_size = 3e-4
+    max_step_size = 6e-4
+    max_grad_norm = 1
+    steps = 50
+    warmup_steps = 10
     train_up_to = int(len(dataset) * 0.8)
     train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
     train_set = torch.tensor(train_set, dtype=torch.int32).to(device)
     test_set = torch.tensor(test_set, dtype=torch.int32).to(device)
     start_t0 = time.time()
     torch.manual_seed(101)
-    for i in range(50):
+    activities = [ProfilerActivity.CPU]
+    if device == 'cuda':
+        activities.append(ProfilerActivity.CUDA)
+    # with ctx:
+    for i in range(steps):
         start_t = time.time()
         xs, ys = get_batch(train_set, llm.max_T, llm.max_B)
+        batch_t = to_ms(time.time() - start_t)
+        start_t_2 = time.time()
         _, loss = llm.forward(xs, ys)
-        mem_before = int(torch.cuda.memory_allocated() / (1024 * 1024))
-        llm.backward(ys)
-        mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
-        llm.apply_gradient(step_size)
-        tokens_ps = int((llm.max_B * llm.max_T) / (time.time() - start_t))
-        print(
-            f"Loss at {i}= {round(loss.item(), 4)}, dt={int(1000 * (time.time() - start_t))}  TPS: {tokens_ps
-            }   mem: {mem_before}, {mem_after}"
-        )
 
+        forward_t = to_ms(time.time() - start_t_2)
+        start_t_2 = time.time()
+        mem_before = int(torch.cuda.memory_allocated() / (1024 * 1024))
+        # with profile(activities=activities, record_shapes=False) as prof:
+        #     with record_function(" Backward pass"):
+        llm.backward(ys)
+
+        backward_t = to_ms(time.time() - start_t_2)
+        start_t_2 = time.time()
+        mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
+        norm = llm.get_grad_norm()
+        norm_t = to_ms(time.time() - start_t_2)
+        start_t_2 = time.time()
+        curr_step_size = get_cosine_step_size(i, steps, max_step_size, warmup_steps)
+        if norm > max_grad_norm:
+            curr_step_size /=  (norm / max_grad_norm)
+        llm.apply_gradient(curr_step_size)
+
+        apply_t= to_ms(time.time() - start_t_2)
+        tokens_ps = int((llm.max_B * llm.max_T) / (time.time() - start_t))
+        print(f"Loss at {i}= {round(loss.item(), 4)}, dt={to_ms(time.time() - start_t)}  TPS: {tokens_ps}   mem: {mem_before},"
+              f" {mem_after}, gb {batch_t} f {forward_t} b {backward_t} a {apply_t} n {norm_t} Norm: {norm}, lr {curr_step_size}")
+
+        # print(prof.key_averages().table(sort_by="cuda_time_total", row_limit=10))
+        # quit()
         if i != 0 and i % 100 == 0:
             train_loss = calculate_loss(llm, train_set)
             test_loss = calculate_loss(llm, test_set)
             print(f"\nTraining loss: {train_loss}")
             print(f"Testing loss: {test_loss}\n")
-    torch.cuda.synchronize()
     print(f"Training time: {time.time() - start_t0}")
+
 
 
 def main():
@@ -176,40 +204,26 @@ def main():
         assert decoded == text
     test_forward_backward(gpt2_tokenizer, encoded_dataset)
 
-    batch_size = 8
+    batch_size = 12
     block_size = 1024
     emb_dimension = 768
-    vocab_size = 50257
+    vocab_size = 50304 # 50257
     n_heads = 12
     dropout = 0.0
-    adam_betas = (0.9, 0.999)
-    # adam_betas = None
+    adam_betas = (0.9, 0.95)
+    weight_decay = 0.1
+    use_ctx = True
+    local = True
 
-    # with ctx:
-    llm = GPT2Model(None, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout, adam_betas)
-    train(llm, dataset=encoded_dataset)
+    if local:
+        batch_size = 4
+        use_ctx = False
 
-    # first_encoding = torch.tensor(
-    #     [
-    #         gpt2_tokenizer.encode("I am very curious about"),
-    #         gpt2_tokenizer.encode("Why do you always complain"),
-    #     ],
-    #     dtype=torch.long,
-    # )
-    # new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
-    # results = []
-    # for i in range(new_tokens.shape[0]):
-    #     results.append(gpt2_tokenizer.decode(new_tokens[i][:].tolist()))
-
-    # xs, ys = get_batch(encoded_dataset, current_context, 2)
-    # new_xs = llm.generate(xs, 10)
-    # for i in range(new_xs.shape[0]):
-    #     print("First prediction: ")
-    #     print(gpt2_tokenizer.decode(new_xs[i][current_context- 10:].tolist()))
-    #
+    with ConditionalAutocast(use_ctx):
+        llm = GPT2Model(None, batch_size, block_size, emb_dimension, vocab_size, n_heads, dropout, weight_decay, adam_betas)
+        train(llm, dataset=encoded_dataset)
 
 
 if __name__ == "__main__":
     with torch.no_grad():
-        # with ctx:
         main()
