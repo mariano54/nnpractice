@@ -19,11 +19,11 @@ def linear_rw(
     if residual_scaling_num_layers is not None:
         std_dev /= math.sqrt(residual_scaling_num_layers)
 
-    weights = torch.normal(mean=0, std=std_dev, size=(input_dim, output_dim)).float().to(device)
+    weights = torch.normal(mean=0, std=std_dev, size=(input_dim, output_dim)).to(device)
     if zero_biases:
         bias = torch.zeros(output_dim).float().to(device)
     else:
-        bias = torch.normal(mean=0, std=1, size=(output_dim,)).float().to(device)
+        bias = torch.normal(mean=0, std=1, size=(output_dim,)).to(device)
     return weights, bias
 
 
