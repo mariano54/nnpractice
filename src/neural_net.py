@@ -10,9 +10,6 @@ from src.gpt2_weights import GPT2Weights, TransformerWeights, AttentionWeights
 from src.random_weights import linear_rw, layer_batch_norm_rw
 
 
-print(f"Using {device} device")
-
-
 def adam_update(
     learning_rate: float,
     betas: Tuple[float, float],
@@ -123,10 +120,10 @@ class GPT2Model:
         # xs and ys are shape (B,T)
         assert xs.shape[0] <= self.max_B
         assert xs.shape[1] <= self.max_T
-        self.xs = xs
+        self.xs = xs.to(torch.int)
         # TODO: enable inputs of different sizes within batch
 
-        embeddings = self.token_embeddings[xs]  # Should result in B,T,C vector
+        embeddings = self.token_embeddings[self.xs]  # Should result in B,T,C vector
         position_emb = self.positional_embeddings[torch.arange(0, xs.shape[1]).to(device)]
 
         start = embeddings + position_emb
@@ -146,7 +143,7 @@ class GPT2Model:
                 torch.log(
                     self.final_softmax.probs[
                         range(self.final_softmax.probs.shape[0]),
-                        ys.view((self.B * self.T)),
+                        ys.to(torch.int).view((self.B * self.T)),
                     ]
                 )
             )
@@ -178,7 +175,9 @@ class GPT2Model:
 
     def backward(self, labels: torch.Tensor) -> None:
         assert self.final_softmax.probs is not None
-        dlogits = self.final_softmax.backward_cross_entropy(labels.view((self.B * self.T), 1))
+        dlogits = self.final_softmax.backward_cross_entropy(
+            labels.to(torch.int).view((self.B * self.T), 1)
+        )
 
         dpre_lm_head = dlogits @ self.lm_head
         dlm_head_w = self.pre_lm_head.T @ dlogits
@@ -285,8 +284,7 @@ class GPT2Model:
         for param in self.gradients():
             param *= scaling_factor
 
-    def synchronize_gradients(self, world_size: int):
-        dist_group = dist.new_group(list(range(world_size)))
+    def synchronize_gradients(self, dist_group, world_size: int):
         for i, param in enumerate(self.gradients()):
             dist.all_reduce(param, op=dist.ReduceOp.SUM, group=dist_group)
             param /= world_size

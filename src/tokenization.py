@@ -22,8 +22,9 @@ with open("weights/gpt2_encoder.json", "rb") as f:
         encoding_map[k] = v
 
 with open("weights/gpt2_vocab.bpe", "rb") as f:
-    merges: Dict[Tuple[str, str], int] = {tuple(l[:-1].decode("utf-8").split(' ')): i + 256 for i, l in
-                                          enumerate(f.readlines()[1:])}
+    merges: Dict[Tuple[str, str], int] = {
+        tuple(l[:-1].decode("utf-8").split(" ")): i + 256 for i, l in enumerate(f.readlines()[1:])
+    }
 
 
 def get_stats(unicode_str: List[str]) -> Dict[Tuple[str, str], int]:
@@ -41,29 +42,31 @@ class GPT2Tokenizer:
         self.decoding_map = {v: k for k, v in encoding_map.items()}
         self.byte_encoding = self.bytes_to_unicode()
         self.byte_decoding = {v: k for k, v in self.byte_encoding.items()}
+        self.pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+        self.gpt2_regex = regex.compile(self.pat_str)
 
     # Taken from https://github.com/openai/gpt-2/blob/master/src/encoder.py (MIT LICENSE)
     @lru_cache()
     def bytes_to_unicode(self):
-        bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(
-            range(ord("®"), ord("ÿ") + 1))
+        bs = (
+            list(range(ord("!"), ord("~") + 1))
+            + list(range(ord("¡"), ord("¬") + 1))
+            + list(range(ord("®"), ord("ÿ") + 1))
+        )
         cs = bs[:]
         n = 0
-        for b in range(2 ** 8):
+        for b in range(2**8):
             if b not in bs:
                 bs.append(b)
-                cs.append(2 ** 8 + n)
+                cs.append(2**8 + n)
                 n += 1
         cs = [chr(n) for n in cs]
         return dict(zip(bs, cs))
 
     def encode(self, str_to_encode: str) -> List[int]:
-        pat_str = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
-        gpt2_regex = regex.compile(pat_str)
         final_list: List[str] = []
-        out_count = 0
         in_count = 0
-        for sub_string in gpt2_regex.findall(str_to_encode):
+        for sub_string in self.gpt2_regex.findall(str_to_encode):
             in_count += 1
             current_str: List[str] = [self.byte_encoding[b] for b in sub_string.encode("utf-8")]
             not_found_strs: Set[Tuple[str, str]] = set()
@@ -71,9 +74,11 @@ class GPT2Tokenizer:
                 in_count += 1
                 stats = get_stats(current_str)
                 large_number = 999999999
-                merge_options = [(self.merges.get((pair[0], pair[1]), large_number), pair)
-                                 for pair in stats.keys()
-                                 if pair not in not_found_strs]
+                merge_options = [
+                    (self.merges.get((pair[0], pair[1]), large_number), pair)
+                    for pair in stats.keys()
+                    if pair not in not_found_strs
+                ]
                 if len(merge_options) == 0:
                     final_list += current_str
                     break
@@ -100,12 +105,39 @@ class GPT2Tokenizer:
         decoded_utf8 = b"".join([bytes([self.byte_decoding[c]]) for c in unicode_str])
         return decoded_utf8.decode("utf-8", errors="replace")
 
+
 def _test():
     gpt2_tokenizer = GPT2Tokenizer()
     test_str = "hello world こんにちは, 今日は \n\n don't say but do... !"
     result = gpt2_tokenizer.encode(test_str)
-    assert result == [31373, 995, 23294, 241, 22174, 28618, 2515, 94, 31676, 11, 220, 20015, 232, 33768, 98, 31676, 220,
-                      628, 836, 470, 910, 475, 466, 986, 5145]
-    assert(gpt2_tokenizer.decode(result) == test_str)
+    assert result == [
+        31373,
+        995,
+        23294,
+        241,
+        22174,
+        28618,
+        2515,
+        94,
+        31676,
+        11,
+        220,
+        20015,
+        232,
+        33768,
+        98,
+        31676,
+        220,
+        628,
+        836,
+        470,
+        910,
+        475,
+        466,
+        986,
+        5145,
+    ]
+    assert gpt2_tokenizer.decode(result) == test_str
+
 
 # _test()

@@ -1,58 +1,28 @@
 import math
 import os
-import pickle
+import signal
 import sys
 import time
-from pathlib import Path
-from typing import List, Callable
+from typing import Callable
 
 import torch
-from src.gpt2_weights import GPT2Weights
+
+from src.data_loading import (
+    get_batch_consecutive,
+    get_filepaths,
+    partition_filepaths,
+    DataLoader,
+)
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from src.torch_settings import ConditionalAutocast, device
-from src.tokenization import GPT2Tokenizer
+from src.torch_settings import ConditionalAutocast, get_device
 from src.neural_net import GPT2Model, TransformerBlock
 from src import neural_net, torch_settings
 
 
-def get_device():
-    return torch_settings.device
-
-
 def to_ms(secs: float) -> int:
     return int(secs * 1000)
-
-
-def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
-    xs = []
-    ys = []
-    for i in range(batch_size):
-        index_start = torch.randint(0, len(dataset) - (block_size + 1), (1,))[0]
-        data_slice = dataset[index_start : index_start + block_size + 1].clone()
-
-        xs.append(data_slice[:-1])
-        ys.append(data_slice[1:])
-    res = torch.stack(xs).to(get_device()), torch.stack(ys).to(get_device())
-    return res
-
-
-def get_batch_consecutive(dataset: torch.tensor, block_size: int, batch_size: int, index_start: int):
-    xs = []
-    ys = []
-    end = index_start
-    for i in range(batch_size):
-        start = index_start + i * block_size
-        end = min(start + block_size + 1, len(dataset))
-        data_slice = dataset[start:end].clone()
-        if len(xs) > 0 and xs[0].shape[0] != data_slice.shape[0] - 1:
-            break
-        xs.append(data_slice[:-1])
-        ys.append(data_slice[1:])
-        if end > len(dataset) - 1:
-            break
-    return torch.stack(xs).to(get_device()), torch.stack(ys).to(get_device()), end - 1
 
 
 def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, warmup: int) -> float:
@@ -69,77 +39,7 @@ def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, 
     return min_step_size + coeff * (min_step_size_ratio * max_step_size)
 
 
-def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[int]):
-    if Path("data/gpt2_weights.pkl").is_file():
-        weights: GPT2Weights = pickle.load(open("data/gpt2_weights.pkl", "rb"))
-        weights = weights.to(get_device())
-    else:
-        raise RuntimeError("Run the load_gpt2_weights file first to create the weights")
-
-    batch_size = 16
-    block_size = 64
-    emb_dimension = 768
-    vocab_size = 50257
-    n_heads = 12
-    dropout = 0.0
-    topk = 200
-    weight_decay = 0.1
-    llm = GPT2Model(
-        weights,
-        batch_size,
-        block_size,
-        emb_dimension,
-        vocab_size,
-        n_heads,
-        dropout,
-        weight_decay,
-        (0.9, 0.999),
-    )
-    first_encoding = torch.tensor(
-        [
-            gpt2_tokenizer.encode("I am very curious about"),
-            gpt2_tokenizer.encode("Why do you always complain"),
-        ],
-        dtype=torch.long,
-    ).to(get_device())
-
-    new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
-    results = []
-    for i in range(new_tokens.shape[0]):
-        results.append(gpt2_tokenizer.decode(new_tokens[i][:].tolist()))
-    print(f"Results {results}")
-    assert results == [
-        "I am very curious about the nature of the relationship",
-        "Why do you always complain about the lack of quality",
-    ]
-
-    print("First test successful.")
-
-    torch.manual_seed(100)
-    xs, ys = get_batch(
-        torch.tensor(encoded_dataset, dtype=torch.int32).to(get_device()),
-        block_size,
-        batch_size,
-    )
-    _, loss1 = llm.forward(xs, ys)
-    assert torch.isclose(loss1, torch.tensor(4.84), atol=2e-1)
-    llm.backward(ys)
-    llm.apply_gradient(0.0001)
-    llm.zero_gradients()
-    _, loss2 = llm.forward(xs, ys)
-    assert torch.isclose(loss2, torch.tensor(3.9), atol=2e-1)
-    loss = 0
-    for i in range(50):
-        _, loss = llm.forward(xs, ys)
-        llm.backward(ys)
-        llm.apply_gradient(0.0001)
-        llm.zero_gradients()
-    assert torch.isclose(loss, torch.tensor(0.007), atol=3e-3)
-    print(f"Successfully optimized batch to 0. Initial losses {loss1.item():0.2f} {loss2.item():0.2f}")
-
-
 def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
-    # torch.manual_seed(100)
     losses = []
     index = 0
     while True:
@@ -152,42 +52,39 @@ def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     return torch.tensor(losses).mean().item()
 
 
-def train(llm: GPT2Model, dataset: List[int], rank: int, world_size: int):
+def train(llm: GPT2Model, dataset_name: str, rank: int, world_size: int):
     max_step_size = 6e-4
     max_grad_norm = 1
-    steps = 100
-    warmup_steps = 10
-    train_up_to = int(len(dataset) * 0.8)
-    full_train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
+    steps = 19073  # 10B / 2**19
+    warmup_steps = 715  # 375 million tokens
+    train_paths = get_filepaths(dataset_name, "train")
+    train_paths_for_rank = partition_filepaths(train_paths, world_size)[(rank - 1) % world_size]
+    print(f"Rank {rank} training on files: {train_paths_for_rank}")
+    data_loader = DataLoader(train_paths_for_rank)
 
-    sub_train_size = (len(full_train_set) // world_size) + 1
-    train_set = full_train_set[rank * sub_train_size : (rank + 1) * sub_train_size]
-    print(
-        f"Len full: {len(full_train_set)}, len of rank {rank} set: {len(train_set)}, start{rank*sub_train_size} end {(rank+1)*sub_train_size}"
-    )
-
-    train_set = torch.tensor(train_set, dtype=torch.int32).to(get_device())
-    test_set = torch.tensor(test_set, dtype=torch.int32).to(get_device())
     start_t0 = time.time()
     torch.manual_seed(102)
-    dataset_index = 0
-    total_batch_size = 64
+    total_batch_size = 2**22
     assert total_batch_size % llm.max_B == 0
-    num_mini_batches = int(total_batch_size / llm.max_B)
+    num_mini_batches = int(total_batch_size / (llm.max_B * llm.max_T * world_size))
+    dist_group = dist.new_group(list(range(world_size)))
+
+    print(
+        f"Starting training run on {get_device()}, steps: {steps} w{warmup_steps}, max_ss: {max_step_size} max grad: {max_grad_norm} B: {llm.max_B} T: {llm.max_T} large batch {total_batch_size}"
+    )
 
     for step_i in range(steps):
         start_t = time.time()
         entries_processed = torch.tensor([0], dtype=torch.float32).to(get_device())
         total_loss = torch.tensor([0], dtype=torch.float32).to(get_device())
         for mini_batch_i in range(num_mini_batches):
-            if dataset_index == len(train_set) - 1:
-                dataset_index = 0
-            xs, ys, dataset_index = get_batch_consecutive(train_set, llm.max_T, llm.max_B, dataset_index)
+            xs, ys = data_loader.get_batch(llm.max_T, llm.max_B)
             _, loss = llm.forward(xs, ys)
             total_loss += loss
             entries_processed += xs.shape[0] * xs.shape[1]
             llm.backward(ys)
-        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)}")
+        tokens_ps = int((entries_processed.item()) / (time.time() - start_t))
+        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)} with TPS {tokens_ps}")
         total_loss /= num_mini_batches
 
         mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
@@ -198,8 +95,7 @@ def train(llm: GPT2Model, dataset: List[int], rank: int, world_size: int):
         if norm > max_grad_norm:
             scaling_factor = norm / max_grad_norm
         llm.scale_gradients(1 / scaling_factor)
-        llm.synchronize_gradients(world_size)
-        dist_group = dist.new_group(list(range(world_size)))
+        llm.synchronize_gradients(dist_group, world_size)
         dist.reduce(entries_processed, 0, op=dist.ReduceOp.SUM, group=dist_group)
         dist.reduce(total_loss, 0, op=dist.ReduceOp.SUM, group=dist_group)
 
@@ -214,18 +110,28 @@ def train(llm: GPT2Model, dataset: List[int], rank: int, world_size: int):
                 f" {mem_after}, Norm: {norm:.2f} scaling {scaling_factor:.2f}, batches{num_mini_batches} lr {curr_step_size:.5f}"
             )
             if step_i != 0 and step_i % 100 == 0:
-                train_loss = calculate_loss(llm, train_set)
-                test_loss = calculate_loss(llm, test_set)
-                print(f"\nTraining loss: {train_loss}")
-                print(f"Testing loss: {test_loss}\n")
+                # TODO: validation loss and train loss
+                pass
+                # train_loss = calculate_loss(llm, train_set)
+                # test_loss = calculate_loss(llm, test_set)
+                # print(f"\nTraining loss: {train_loss}")
+                # print(f"Testing loss: {test_loss}\n")
+
     print(f"Training time: {time.time() - start_t0}")
 
 
 def main(rank: int, world_size: int):
-    if device != "cpu":
+    # if rank == 0:
+    #     torch_settings.device = f"cpu"
+    #     neural_net.device = f"cpu"
+    # else:
+    #     torch_settings.device = "cuda"
+    #     neural_net.device = f"cuda"
+
+    if get_device() != "cpu":
         torch_settings.device = f"cuda:{rank}"
         neural_net.device = f"cuda:{rank}"
-    print(f"Running main, rank {rank}, world size {world_size} on device: {device}")
+    print(f"Running main, rank {rank}, world size {world_size} on device: {get_device()}")
 
     # Below configuration taken from https://github.com/karpathy/nanoGPT
     with torch.no_grad():
@@ -233,21 +139,6 @@ def main(rank: int, world_size: int):
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.set_printoptions(precision=4)
-
-        gpt2_tokenizer = GPT2Tokenizer()
-        if Path("data/shakespeare.pkl").is_file():
-            encoded_dataset = pickle.load(open("data/shakespeare.pkl", "rb"))
-        else:
-            with open("data/shakespeare.txt", "r") as f:
-                text = f.read()
-
-            encoded_dataset = gpt2_tokenizer.encode(text)
-            pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
-            decoded = gpt2_tokenizer.decode(
-                encoded_dataset,
-            )
-            assert decoded == text
-
         batch_size = 8
         block_size = 1024
 
@@ -257,25 +148,24 @@ def main(rank: int, world_size: int):
         dropout = 0.0
         adam_betas = (0.9, 0.95)
         weight_decay = 0.1
+        dataset_name = "sample-10BT"
+        compile_pytorch = True
         local = sys.argv[1].lower()
         if local == "true":
             local = True
         else:
             local = False
-        print(f"Local: {local}")
-
-        compile_pytorch = True
 
         if local:
             batch_size = 4
             block_size = 64
             compile_pytorch = False
+            dataset_name = "small_shard"
 
         with ConditionalAutocast(not local):
             if compile_pytorch:
                 GPT2Model.forward = torch.compile(GPT2Model.forward)
                 TransformerBlock.backward = torch.compile(TransformerBlock.backward)
-            # test_forward_backward(gpt2_tokenizer, encoded_dataset)
 
             llm = GPT2Model(
                 None,
@@ -288,7 +178,7 @@ def main(rank: int, world_size: int):
                 weight_decay,
                 adam_betas,
             )
-            train(llm, dataset=encoded_dataset, rank=rank, world_size=world_size)
+            train(llm, dataset_name=dataset_name, rank=rank, world_size=world_size)
 
 
 def init_process(rank: int, size: int, fn: Callable, backend="gloo"):
@@ -296,11 +186,13 @@ def init_process(rank: int, size: int, fn: Callable, backend="gloo"):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = "29500"
     dist.init_process_group(backend, rank=rank, world_size=size)
+
     fn(rank, size)
 
 
 if __name__ == "__main__":
     num_processes = torch.cuda.device_count()
+    # num_processes = 2
     processes = []
     mp.set_start_method("spawn")
 
@@ -308,5 +200,16 @@ if __name__ == "__main__":
         p = mp.Process(target=init_process, args=(my_rank, num_processes, main))
         p.start()
         processes.append(p)
+
+    def signal_handler(sig, frame):
+        print("You pressed Ctrl+C!, closing processes..")
+        for p in processes:
+            p.terminate()
+        for p in processes:
+            p.join()
+        sys.exit(0)
+
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.pause()
     for p in processes:
         p.join()
