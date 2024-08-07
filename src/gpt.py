@@ -222,9 +222,9 @@ def train(llm: GPT2Model, dataset: List[int], rank: int, world_size: int):
 
 
 def main(rank: int, world_size: int):
-    if rank == 0:
-        torch_settings.device = "cpu"
-        neural_net.device = "cpu"
+    if device != "cpu":
+        torch_settings.device = f"cuda:{rank}"
+        neural_net.device = f"cuda:{rank}"
     print(f"Running main, rank {rank}, world size {world_size} on device: {device}")
 
     # Below configuration taken from https://github.com/karpathy/nanoGPT
@@ -300,7 +300,7 @@ def init_process(rank: int, size: int, fn: Callable, backend="gloo"):
 
 
 if __name__ == "__main__":
-    num_processes = 2
+    num_processes = torch.cuda.device_count()
     processes = []
     mp.set_start_method("spawn")
 
