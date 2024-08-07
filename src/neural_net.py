@@ -3,11 +3,13 @@ from typing import List, Optional, Tuple
 
 import math
 import torch
+import torch.distributed as dist
 
+from src.torch_settings import device
 from src.gpt2_weights import GPT2Weights, TransformerWeights, AttentionWeights
 from src.random_weights import linear_rw, layer_batch_norm_rw
 
-device = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
 print(f"Using {device} device")
 
 
@@ -247,57 +249,47 @@ class GPT2Model:
         self.dpos_embeddings.zero_()
         self.dtoken_embeddings.zero_()
 
-    def get_weights(self) -> GPT2Weights:
-        pass
+    def gradients(self) -> List[torch.tensor]:
+        params = [
+            self.dpos_embeddings,
+            self.dtoken_embeddings,
+            self.final_ln.d_gain,
+            self.final_ln.d_bias,
+        ]
+        for layer in self.transformer_blocks:
+            params.append(layer.MLP_section[0].d_gain)
+            params.append(layer.MLP_section[0].d_bias)
+            params.append(layer.MLP_section[1].dW)
+            params.append(layer.MLP_section[1].dbias)
+            params.append(layer.MLP_section[3].dW)
+            params.append(layer.MLP_section[3].dbias)
+            params.append(layer.attention_section[0].d_gain)
+            params.append(layer.attention_section[0].d_bias)
+            params.append(layer.attention_section[1].q_map.dW)
+            params.append(layer.attention_section[1].q_map.dbias)
+            params.append(layer.attention_section[1].k_map.dW)
+            params.append(layer.attention_section[1].k_map.dbias)
+            params.append(layer.attention_section[1].v_map.dW)
+            params.append(layer.attention_section[1].v_map.dbias)
+            params.append(layer.attention_section[1].proj_map.dW)
+            params.append(layer.attention_section[1].proj_map.dbias)
+        return params
 
     def get_grad_norm(self) -> float:
-        s = torch.sum(self.dpos_embeddings**2)
-        s += torch.sum(self.dtoken_embeddings**2)
-        s += torch.sum(self.final_ln.d_gain**2)
-        s += torch.sum(self.final_ln.d_bias**2)
-        for layer in self.transformer_blocks:
-            s += torch.sum(layer.MLP_section[0].d_gain ** 2)
-            s += torch.sum(layer.MLP_section[0].d_bias ** 2)
-            s += torch.sum(layer.MLP_section[1].dW ** 2)
-            s += torch.sum(layer.MLP_section[1].dbias ** 2)
-            s += torch.sum(layer.MLP_section[3].dW ** 2)
-            s += torch.sum(layer.MLP_section[3].dbias ** 2)
-
-            s += torch.sum(layer.attention_section[0].d_gain ** 2)
-            s += torch.sum(layer.attention_section[0].d_bias ** 2)
-            s += torch.sum(layer.attention_section[1].q_map.dW ** 2)
-            s += torch.sum(layer.attention_section[1].q_map.dbias ** 2)
-            s += torch.sum(layer.attention_section[1].k_map.dW ** 2)
-            s += torch.sum(layer.attention_section[1].k_map.dbias ** 2)
-            s += torch.sum(layer.attention_section[1].v_map.dW ** 2)
-            s += torch.sum(layer.attention_section[1].v_map.dbias ** 2)
-            s += torch.sum(layer.attention_section[1].proj_map.dW ** 2)
-            s += torch.sum(layer.attention_section[1].proj_map.dbias ** 2)
-        return torch.sqrt(s).item()
+        s = 0
+        for param in self.gradients():
+            s += torch.sum(param**2)
+        return math.sqrt(s)
 
     def scale_gradients(self, scaling_factor: float):
-        self.dpos_embeddings *= scaling_factor
-        self.dtoken_embeddings *= scaling_factor
-        self.final_ln.d_gain *= scaling_factor
-        self.final_ln.d_bias *= scaling_factor
-        for layer in self.transformer_blocks:
-            layer.MLP_section[0].d_gain *= scaling_factor
-            layer.MLP_section[0].d_bias *= scaling_factor
-            layer.MLP_section[1].dW *= scaling_factor
-            layer.MLP_section[1].dbias *= scaling_factor
-            layer.MLP_section[3].dW *= scaling_factor
-            layer.MLP_section[3].dbias *= scaling_factor
+        for param in self.gradients():
+            param *= scaling_factor
 
-            layer.attention_section[0].d_gain *= scaling_factor
-            layer.attention_section[0].d_bias *= scaling_factor
-            layer.attention_section[1].q_map.dW *= scaling_factor
-            layer.attention_section[1].q_map.dbias *= scaling_factor
-            layer.attention_section[1].k_map.dW *= scaling_factor
-            layer.attention_section[1].k_map.dbias *= scaling_factor
-            layer.attention_section[1].v_map.dW *= scaling_factor
-            layer.attention_section[1].v_map.dbias *= scaling_factor
-            layer.attention_section[1].proj_map.dW *= scaling_factor
-            layer.attention_section[1].proj_map.dbias *= scaling_factor
+    def synchronize_gradients(self, world_size: int):
+        dist_group = dist.new_group(list(range(world_size)))
+        for i, param in enumerate(self.gradients()):
+            dist.all_reduce(param, op=dist.ReduceOp.SUM, group=dist_group)
+            param /= world_size
 
 
 class Relu:

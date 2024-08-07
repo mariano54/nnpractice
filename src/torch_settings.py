@@ -20,6 +20,7 @@ ctx = (
     nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 )
 
+
 class ConditionalAutocast:
     def __init__(self, use_autocast):
         self.use_autocast = use_autocast

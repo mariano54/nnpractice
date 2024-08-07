@@ -1,18 +1,24 @@
-import dataclasses
 import math
+import os
 import pickle
 import sys
 import time
-from contextlib import nullcontext
 from pathlib import Path
-from typing import List
+from typing import List, Callable
 
 import torch
 from src.gpt2_weights import GPT2Weights
-from torch.profiler import ProfilerActivity
+import torch.distributed as dist
+import torch.multiprocessing as mp
+
 from src.torch_settings import ConditionalAutocast, device
 from src.tokenization import GPT2Tokenizer
-from src.neural_net import GPT2Model, device, TransformerBlock
+from src.neural_net import GPT2Model, TransformerBlock
+from src import neural_net, torch_settings
+
+
+def get_device():
+    return torch_settings.device
 
 
 def to_ms(secs: float) -> int:
@@ -28,7 +34,7 @@ def get_batch(dataset: torch.tensor, block_size: int, batch_size: int):
 
         xs.append(data_slice[:-1])
         ys.append(data_slice[1:])
-    res = torch.stack(xs).to(device), torch.stack(ys).to(device)
+    res = torch.stack(xs).to(get_device()), torch.stack(ys).to(get_device())
     return res
 
 
@@ -46,7 +52,7 @@ def get_batch_consecutive(dataset: torch.tensor, block_size: int, batch_size: in
         ys.append(data_slice[1:])
         if end > len(dataset) - 1:
             break
-    return torch.stack(xs).to(device), torch.stack(ys).to(device), end - 1
+    return torch.stack(xs).to(get_device()), torch.stack(ys).to(get_device()), end - 1
 
 
 def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, warmup: int) -> float:
@@ -66,7 +72,7 @@ def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, 
 def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[int]):
     if Path("data/gpt2_weights.pkl").is_file():
         weights: GPT2Weights = pickle.load(open("data/gpt2_weights.pkl", "rb"))
-        weights = weights.to(device)
+        weights = weights.to(get_device())
     else:
         raise RuntimeError("Run the load_gpt2_weights file first to create the weights")
 
@@ -95,7 +101,7 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
             gpt2_tokenizer.encode("Why do you always complain"),
         ],
         dtype=torch.long,
-    ).to(device)
+    ).to(get_device())
 
     new_tokens = llm.generate(first_encoding, 5, topk, temperature=0.001)
     results = []
@@ -111,7 +117,7 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
 
     torch.manual_seed(100)
     xs, ys = get_batch(
-        torch.tensor(encoded_dataset, dtype=torch.int32).to(device),
+        torch.tensor(encoded_dataset, dtype=torch.int32).to(get_device()),
         block_size,
         batch_size,
     )
@@ -146,15 +152,22 @@ def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     return torch.tensor(losses).mean().item()
 
 
-def train(llm: GPT2Model, dataset: List[int]):
+def train(llm: GPT2Model, dataset: List[int], rank: int, world_size: int):
     max_step_size = 6e-4
     max_grad_norm = 1
     steps = 100
     warmup_steps = 10
     train_up_to = int(len(dataset) * 0.8)
-    train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
-    train_set = torch.tensor(train_set, dtype=torch.int32).to(device)
-    test_set = torch.tensor(test_set, dtype=torch.int32).to(device)
+    full_train_set, test_set = dataset[:train_up_to], dataset[train_up_to:]
+
+    sub_train_size = (len(full_train_set) // world_size) + 1
+    train_set = full_train_set[rank * sub_train_size : (rank + 1) * sub_train_size]
+    print(
+        f"Len full: {len(full_train_set)}, len of rank {rank} set: {len(train_set)}, start{rank*sub_train_size} end {(rank+1)*sub_train_size}"
+    )
+
+    train_set = torch.tensor(train_set, dtype=torch.int32).to(get_device())
+    test_set = torch.tensor(test_set, dtype=torch.int32).to(get_device())
     start_t0 = time.time()
     torch.manual_seed(102)
     dataset_index = 0
@@ -164,14 +177,18 @@ def train(llm: GPT2Model, dataset: List[int]):
 
     for step_i in range(steps):
         start_t = time.time()
-        entries_processed = 0
+        entries_processed = torch.tensor([0], dtype=torch.float32).to(get_device())
+        total_loss = torch.tensor([0], dtype=torch.float32).to(get_device())
         for mini_batch_i in range(num_mini_batches):
             if dataset_index == len(train_set) - 1:
                 dataset_index = 0
             xs, ys, dataset_index = get_batch_consecutive(train_set, llm.max_T, llm.max_B, dataset_index)
             _, loss = llm.forward(xs, ys)
+            total_loss += loss
             entries_processed += xs.shape[0] * xs.shape[1]
             llm.backward(ys)
+        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)}")
+        total_loss /= num_mini_batches
 
         mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
         llm.scale_gradients(1 / num_mini_batches)
@@ -181,88 +198,115 @@ def train(llm: GPT2Model, dataset: List[int]):
         if norm > max_grad_norm:
             scaling_factor = norm / max_grad_norm
         llm.scale_gradients(1 / scaling_factor)
+        llm.synchronize_gradients(world_size)
+        dist_group = dist.new_group(list(range(world_size)))
+        dist.reduce(entries_processed, 0, op=dist.ReduceOp.SUM, group=dist_group)
+        dist.reduce(total_loss, 0, op=dist.ReduceOp.SUM, group=dist_group)
 
-        print("first positional emb grad", llm.dpos_embeddings[0][:5])
         llm.apply_gradient(curr_step_size)
         llm.zero_gradients()
 
-        tokens_ps = int((entries_processed) / (time.time() - start_t))
-        print(
-            f"Loss at {step_i}= {round(loss.item(), 4)}, dt={to_ms(time.time() - start_t)}  TPS: {tokens_ps} "
-            f" {mem_after}, Norm: {norm:.2f} scaling {scaling_factor:.2f}, batches{num_mini_batches} lr {curr_step_size:.5f}"
-        )
-        if step_i != 0 and step_i % 100 == 0:
-            train_loss = calculate_loss(llm, train_set)
-            test_loss = calculate_loss(llm, test_set)
-            print(f"\nTraining loss: {train_loss}")
-            print(f"Testing loss: {test_loss}\n")
+        if rank == 0:
+            total_loss /= world_size
+            tokens_ps = int((entries_processed.item()) / (time.time() - start_t))
+            print(
+                f"Loss at {step_i}= {round(total_loss.item(), 4)}, dt={to_ms(time.time() - start_t)}  TPS: {tokens_ps} "
+                f" {mem_after}, Norm: {norm:.2f} scaling {scaling_factor:.2f}, batches{num_mini_batches} lr {curr_step_size:.5f}"
+            )
+            if step_i != 0 and step_i % 100 == 0:
+                train_loss = calculate_loss(llm, train_set)
+                test_loss = calculate_loss(llm, test_set)
+                print(f"\nTraining loss: {train_loss}")
+                print(f"Testing loss: {test_loss}\n")
     print(f"Training time: {time.time() - start_t0}")
 
 
-def main():
+def main(rank: int, world_size: int):
+    if rank == 0:
+        torch_settings.device = "cpu"
+        neural_net.device = "cpu"
+    print(f"Running main, rank {rank}, world size {world_size} on device: {device}")
+
     # Below configuration taken from https://github.com/karpathy/nanoGPT
-    seed = 1337
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.set_printoptions(precision=4)
+    with torch.no_grad():
+        seed = 1337
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed(seed)
+        torch.set_printoptions(precision=4)
 
-    gpt2_tokenizer = GPT2Tokenizer()
-    if Path("data/shakespeare.pkl").is_file():
-        encoded_dataset = pickle.load(open("data/shakespeare.pkl", "rb"))
-    else:
-        with open("data/shakespeare.txt", "r") as f:
-            text = f.read()
+        gpt2_tokenizer = GPT2Tokenizer()
+        if Path("data/shakespeare.pkl").is_file():
+            encoded_dataset = pickle.load(open("data/shakespeare.pkl", "rb"))
+        else:
+            with open("data/shakespeare.txt", "r") as f:
+                text = f.read()
 
-        encoded_dataset = gpt2_tokenizer.encode(text)
-        pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
-        decoded = gpt2_tokenizer.decode(
-            encoded_dataset,
-        )
-        assert decoded == text
+            encoded_dataset = gpt2_tokenizer.encode(text)
+            pickle.dump(encoded_dataset, open("data/shakespeare.pkl", "wb"))
+            decoded = gpt2_tokenizer.decode(
+                encoded_dataset,
+            )
+            assert decoded == text
 
-    batch_size = 8
-    block_size = 1024
-
-    emb_dimension = 768
-    vocab_size = 50304  # 50257
-    n_heads = 12
-    dropout = 0.0
-    adam_betas = (0.9, 0.95)
-    weight_decay = 0.1
-    local = sys.argv[1].lower()
-    if local == "true":
-        local = True
-    else:
-        local = False
-    print(f"Local: {local}")
-
-    compile_pytorch = True
-
-    if local:
-        batch_size = 4
+        batch_size = 8
         block_size = 1024
-        compile_pytorch = False
 
-    with ConditionalAutocast(not local):
-        if compile_pytorch:
-            GPT2Model.forward = torch.compile(GPT2Model.forward)
-            TransformerBlock.backward = torch.compile(TransformerBlock.backward)
-        test_forward_backward(gpt2_tokenizer, encoded_dataset)
+        emb_dimension = 768
+        vocab_size = 50304  # 50257
+        n_heads = 12
+        dropout = 0.0
+        adam_betas = (0.9, 0.95)
+        weight_decay = 0.1
+        local = sys.argv[1].lower()
+        if local == "true":
+            local = True
+        else:
+            local = False
+        print(f"Local: {local}")
 
-        llm = GPT2Model(
-            None,
-            batch_size,
-            block_size,
-            emb_dimension,
-            vocab_size,
-            n_heads,
-            dropout,
-            weight_decay,
-            adam_betas,
-        )
-        train(llm, dataset=encoded_dataset)
+        compile_pytorch = True
+
+        if local:
+            batch_size = 4
+            block_size = 64
+            compile_pytorch = False
+
+        with ConditionalAutocast(not local):
+            if compile_pytorch:
+                GPT2Model.forward = torch.compile(GPT2Model.forward)
+                TransformerBlock.backward = torch.compile(TransformerBlock.backward)
+            # test_forward_backward(gpt2_tokenizer, encoded_dataset)
+
+            llm = GPT2Model(
+                None,
+                batch_size,
+                block_size,
+                emb_dimension,
+                vocab_size,
+                n_heads,
+                dropout,
+                weight_decay,
+                adam_betas,
+            )
+            train(llm, dataset=encoded_dataset, rank=rank, world_size=world_size)
+
+
+def init_process(rank: int, size: int, fn: Callable, backend="gloo"):
+    """Initialize the distributed environment."""
+    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_PORT"] = "29500"
+    dist.init_process_group(backend, rank=rank, world_size=size)
+    fn(rank, size)
 
 
 if __name__ == "__main__":
-    with torch.no_grad():
-        main()
+    num_processes = 2
+    processes = []
+    mp.set_start_method("spawn")
+
+    for my_rank in range(num_processes):
+        p = mp.Process(target=init_process, args=(my_rank, num_processes, main))
+        p.start()
+        processes.append(p)
+    for p in processes:
+        p.join()
