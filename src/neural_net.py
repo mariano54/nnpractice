@@ -6,7 +6,7 @@ import torch
 import torch.distributed as dist
 
 from src.torch_settings import device
-from src.gpt2_weights import GPT2Weights, TransformerWeights, AttentionWeights
+from src.gpt2_weights import GPT2Weights, TransformerWeights, AttentionWeights, MLPWeights
 from src.random_weights import linear_rw, layer_batch_norm_rw
 
 
@@ -288,6 +288,60 @@ class GPT2Model:
         for i, param in enumerate(self.gradients()):
             dist.all_reduce(param, op=dist.ReduceOp.SUM, group=dist_group)
             param /= world_size
+
+    def extract_weights(self):
+        # Extract embeddings
+        wte = self.token_embeddings
+        wpe = self.positional_embeddings
+
+        # Extract transformer blocks weights
+        transformer_weights = []
+        for block in self.transformer_blocks:
+            attention = AttentionWeights(
+                q_weight=block.attention_section[1].q_map.weights,
+                q_bias=block.attention_section[1].q_map.bias,
+                k_weight=block.attention_section[1].k_map.weights,
+                k_bias=block.attention_section[1].k_map.bias,
+                v_weight=block.attention_section[1].v_map.weights,
+                v_bias=block.attention_section[1].v_map.bias,
+                proj_weight=block.attention_section[1].proj_map.weights,
+                proj_bias=block.attention_section[1].proj_map.bias,
+            )
+
+            mlp = MLPWeights(
+                fc_weight=block.MLP_section[1].weights,
+                fc_bias=block.MLP_section[1].bias,
+                proj_weight=block.MLP_section[3].weights,
+                proj_bias=block.MLP_section[3].bias,
+            )
+
+            transformer = TransformerWeights(
+                ln_1_weight=block.attention_section[0].bn_gain,
+                ln_1_bias=block.attention_section[0].bn_bias,
+                attention=attention,
+                mlp=mlp,
+                ln_2_weight=block.MLP_section[0].bn_gain,
+                ln_2_bias=block.MLP_section[0].bn_bias,
+            )
+
+            transformer_weights.append(transformer)
+
+        # Extract final layer norm and LM head weights
+        transformer_ln_f_weight = self.final_ln.bn_gain
+        transformer_ln_f_bias = self.final_ln.bn_bias
+        lm_head_weight = self.lm_head
+
+        # Create GPT2Weights object
+        gpt2_weights = GPT2Weights(
+            wte=wte,
+            wpe=wpe,
+            transformer=transformer_weights,
+            transformer_ln_f_weight=transformer_ln_f_weight,
+            transformer_ln_f_bias=transformer_ln_f_bias,
+            lm_head_weight=lm_head_weight,
+        )
+
+        return gpt2_weights
 
 
 class Relu:

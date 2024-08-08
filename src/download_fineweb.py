@@ -21,7 +21,7 @@ gpt2_tokenizer = GPT2Tokenizer()
 
 # From Andrej Karpathy GPT-2 video
 eot = 50256
-max_shard_size = 100 * (1024)
+max_shard_size = 100 * (1024 * 1024)
 
 
 def tokenize(doc) -> torch.tensor:
@@ -30,11 +30,11 @@ def tokenize(doc) -> torch.tensor:
     return torch.tensor(tokens, dtype=torch.uint16)
 
 
-remote_name = "small_shard"
-nprocs = max(1, os.cpu_count() // 2)
+# remote_name = "small_shard"
+nprocs = max(1, os.cpu_count() - 2)
 shard_index = 0
 chunksize = 32
-max_shards = 10  # Set to non-zero to stop at a certain number of shards
+max_shards = 0  # Set to non-zero to stop at a certain number of shards
 
 with multiprocessing.Pool(nprocs) as pool:
     total_num_tokens = 0
@@ -59,7 +59,7 @@ with multiprocessing.Pool(nprocs) as pool:
             shard_index += 1
         else:
             # append to shard
-            shard_contents[: len(tokens)] = tokens
+            shard_contents[total_num_tokens : total_num_tokens + len(tokens)] = tokens
             total_num_tokens += len(tokens)
             total = time.time() - start_t
     if total_num_tokens > 0:

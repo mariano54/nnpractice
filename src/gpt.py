@@ -52,11 +52,17 @@ def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     return torch.tensor(losses).mean().item()
 
 
-def train(llm: GPT2Model, dataset_name: str, rank: int, world_size: int):
-    max_step_size = 6e-4
-    max_grad_norm = 1
-    steps = 19073  # 10B / 2**19
-    warmup_steps = 715  # 375 million tokens
+def train(
+    llm: GPT2Model,
+    dataset_name: str,
+    rank: int,
+    world_size: int,
+    max_step_size: float,
+    max_grad_norm: float,
+    steps: int,
+    warmup_steps: int,
+    total_batch_size: int,
+):
     train_paths = get_filepaths(dataset_name, "train")
     train_paths_for_rank = partition_filepaths(train_paths, world_size)[(rank - 1) % world_size]
     print(f"Rank {rank} training on files: {train_paths_for_rank}")
@@ -64,7 +70,6 @@ def train(llm: GPT2Model, dataset_name: str, rank: int, world_size: int):
 
     start_t0 = time.time()
     torch.manual_seed(102)
-    total_batch_size = 2**22
     assert total_batch_size % llm.max_B == 0
     num_mini_batches = int(total_batch_size / (llm.max_B * llm.max_T * world_size))
     dist_group = dist.new_group(list(range(world_size)))
@@ -78,26 +83,30 @@ def train(llm: GPT2Model, dataset_name: str, rank: int, world_size: int):
         entries_processed = torch.tensor([0], dtype=torch.float32).to(get_device())
         total_loss = torch.tensor([0], dtype=torch.float32).to(get_device())
         for mini_batch_i in range(num_mini_batches):
+            # print(
+            #     f"Rank {rank} reading at {data_loader.data_index} file {data_loader.curr_file_index} data {data_loader.curr_file[data_loader.data_index:data_loader.data_index+5]}"
+            # )
             xs, ys = data_loader.get_batch(llm.max_T, llm.max_B)
             _, loss = llm.forward(xs, ys)
             total_loss += loss
             entries_processed += xs.shape[0] * xs.shape[1]
             llm.backward(ys)
         tokens_ps = int((entries_processed.item()) / (time.time() - start_t))
-        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)} with TPS {tokens_ps}")
         total_loss /= num_mini_batches
+        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)} with TPS {tokens_ps} loss {loss}")
 
         mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
         llm.scale_gradients(1 / num_mini_batches)
+        llm.synchronize_gradients(dist_group, world_size)
+        dist.reduce(entries_processed, 0, op=dist.ReduceOp.SUM, group=dist_group)
+        dist.reduce(total_loss, 0, op=dist.ReduceOp.SUM, group=dist_group)
+
         norm = llm.get_grad_norm()
         curr_step_size = get_cosine_step_size(step_i, steps, max_step_size, warmup_steps)
         scaling_factor = 1
         if norm > max_grad_norm:
             scaling_factor = norm / max_grad_norm
         llm.scale_gradients(1 / scaling_factor)
-        llm.synchronize_gradients(dist_group, world_size)
-        dist.reduce(entries_processed, 0, op=dist.ReduceOp.SUM, group=dist_group)
-        dist.reduce(total_loss, 0, op=dist.ReduceOp.SUM, group=dist_group)
 
         llm.apply_gradient(curr_step_size)
         llm.zero_gradients()
@@ -127,7 +136,6 @@ def main(rank: int, world_size: int):
     # else:
     #     torch_settings.device = "cuda"
     #     neural_net.device = f"cuda"
-
     if get_device() != "cpu":
         torch_settings.device = f"cuda:{rank}"
         neural_net.device = f"cuda:{rank}"
@@ -139,7 +147,7 @@ def main(rank: int, world_size: int):
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.set_printoptions(precision=4)
-        batch_size = 8
+        batch_size = 16
         block_size = 1024
 
         emb_dimension = 768
@@ -150,6 +158,12 @@ def main(rank: int, world_size: int):
         weight_decay = 0.1
         dataset_name = "sample-10BT"
         compile_pytorch = True
+        max_grad_norm = 1
+        steps = 19073  # 10B / 2**19
+        warmup_steps = 715  # 375 million tokens
+        total_batch_size = 2**21
+        max_step_size = 6e-4 * math.sqrt(total_batch_size / (2**19))
+
         local = sys.argv[1].lower()
         if local == "true":
             local = True
@@ -159,6 +173,7 @@ def main(rank: int, world_size: int):
         if local:
             batch_size = 4
             block_size = 64
+            total_batch_size = 2**15
             compile_pytorch = False
             dataset_name = "small_shard"
 
@@ -178,7 +193,17 @@ def main(rank: int, world_size: int):
                 weight_decay,
                 adam_betas,
             )
-            train(llm, dataset_name=dataset_name, rank=rank, world_size=world_size)
+            train(
+                llm,
+                dataset_name,
+                rank,
+                world_size,
+                max_step_size,
+                max_grad_norm,
+                steps,
+                warmup_steps,
+                total_batch_size,
+            )
 
 
 def init_process(rank: int, size: int, fn: Callable, backend="gloo"):

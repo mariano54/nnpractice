@@ -45,7 +45,7 @@ def get_filepaths(dataset_name: str, train_or_val: str) -> List[Path]:
         i = 1
         while True:
             p = Path(f"data/{dataset_name}_train_{str(i).zfill(6)}.p")
-            if not p.exists() or i >= 19:  # TODO: remove
+            if not p.exists():
                 if len(paths) == 0:
                     raise RuntimeError(f"Error, file {p} not found")
                 return paths
