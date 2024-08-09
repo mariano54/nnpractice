@@ -8,14 +8,15 @@ from typing import Callable
 import torch
 
 from src.data_loading import (
-    get_batch_consecutive,
     get_filepaths,
     partition_filepaths,
     DataLoader,
+    get_batch,
 )
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from src.tokenization import GPT2Tokenizer
 from src.torch_settings import ConditionalAutocast, get_device
 from src.neural_net import GPT2Model, TransformerBlock
 from src import neural_net, torch_settings
@@ -26,7 +27,7 @@ def to_ms(secs: float) -> int:
 
 
 def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, warmup: int) -> float:
-    # From nanoGPT (Andrej Karpathy)
+    # Based on nanoGPT (Andrej Karpathy)
     min_step_size_ratio = 0.1
     min_step_size = min_step_size_ratio * max_step_size
     if step_index <= warmup:
@@ -41,11 +42,8 @@ def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, 
 
 def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     losses = []
-    index = 0
-    while True:
-        if index >= dataset.shape[0]:
-            break
-        xs, ys, index = get_batch_consecutive(dataset, llm.max_T, llm.max_B, index)
+    for i in range(200):
+        xs, ys = get_batch(dataset, llm.max_T, llm.max_B)
         probs, loss = llm.forward(xs, ys)
         losses.append(loss * probs.shape[0] / llm.max_B)  # Normalize for the final batch (maybe smaller)
 
@@ -63,10 +61,16 @@ def train(
     warmup_steps: int,
     total_batch_size: int,
 ):
+    gpt2_tokenizer = GPT2Tokenizer()
     train_paths = get_filepaths(dataset_name, "train")
     train_paths_for_rank = partition_filepaths(train_paths, world_size)[(rank - 1) % world_size]
     print(f"Rank {rank} training on files: {train_paths_for_rank}")
     data_loader = DataLoader(train_paths_for_rank)
+    if rank == 0:
+        validation_paths = get_filepaths(dataset_name, "val")
+        val_data_loader = DataLoader(validation_paths)
+    else:
+        val_data_loader = None
 
     start_t0 = time.time()
     torch.manual_seed(102)
@@ -83,17 +87,12 @@ def train(
         entries_processed = torch.tensor([0], dtype=torch.float32).to(get_device())
         total_loss = torch.tensor([0], dtype=torch.float32).to(get_device())
         for mini_batch_i in range(num_mini_batches):
-            # print(
-            #     f"Rank {rank} reading at {data_loader.data_index} file {data_loader.curr_file_index} data {data_loader.curr_file[data_loader.data_index:data_loader.data_index+5]}"
-            # )
             xs, ys = data_loader.get_batch(llm.max_T, llm.max_B)
             _, loss = llm.forward(xs, ys)
             total_loss += loss
             entries_processed += xs.shape[0] * xs.shape[1]
             llm.backward(ys)
-        tokens_ps = int((entries_processed.item()) / (time.time() - start_t))
         total_loss /= num_mini_batches
-        print(f"Rank {rank} finished in {to_ms(time.time() - start_t)} with TPS {tokens_ps} loss {loss}")
 
         mem_after = int(torch.cuda.memory_allocated() / (1024 * 1024))
         llm.scale_gradients(1 / num_mini_batches)
@@ -118,24 +117,24 @@ def train(
                 f"Loss at {step_i}= {round(total_loss.item(), 4)}, dt={to_ms(time.time() - start_t)}  TPS: {tokens_ps} "
                 f" {mem_after}, Norm: {norm:.2f} scaling {scaling_factor:.2f}, batches{num_mini_batches} lr {curr_step_size:.5f}"
             )
-            if step_i != 0 and step_i % 100 == 0:
-                # TODO: validation loss and train loss
-                pass
-                # train_loss = calculate_loss(llm, train_set)
-                # test_loss = calculate_loss(llm, test_set)
-                # print(f"\nTraining loss: {train_loss}")
-                # print(f"Testing loss: {test_loss}\n")
-
+            if step_i != 0 and step_i % 10 == 0:
+                train_loss = calculate_loss(llm, data_loader.curr_file)
+                validation_loss = calculate_loss(llm, val_data_loader.curr_file)
+                print(f"Training loss: {train_loss:05f}, Validation loss: {validation_loss:05f}")
+                for i in range(15):
+                    gen = llm.generate(
+                        torch.tensor([gpt2_tokenizer.encode("Hi, I am a language model and")]).to(
+                            get_device()
+                        ),
+                        15,
+                        200,
+                        0.8,
+                    )
+                    print("\t", gpt2_tokenizer.decode(gen[0].tolist()))
     print(f"Training time: {time.time() - start_t0}")
 
 
 def main(rank: int, world_size: int):
-    # if rank == 0:
-    #     torch_settings.device = f"cpu"
-    #     neural_net.device = f"cpu"
-    # else:
-    #     torch_settings.device = "cuda"
-    #     neural_net.device = f"cuda"
     if get_device() != "cpu":
         torch_settings.device = f"cuda:{rank}"
         neural_net.device = f"cuda:{rank}"
@@ -147,22 +146,22 @@ def main(rank: int, world_size: int):
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.set_printoptions(precision=4)
-        batch_size = 16
+        batch_size = 16  # Can increase this up to 64 or higher if it fits in GPU
         block_size = 1024
 
         emb_dimension = 768
-        vocab_size = 50304  # 50257
+        vocab_size = 50304  # 50257, increased to 50304 since it's a nicer number
         n_heads = 12
         dropout = 0.0
-        adam_betas = (0.9, 0.95)
+        adam_betas = (0.9, 0.95)  # Based on GPT-2 paper
         weight_decay = 0.1
-        dataset_name = "sample-10BT"
-        compile_pytorch = True
-        max_grad_norm = 1
+        dataset_name = "sample-10BT"  # Fineweb dataset
+        compile_pytorch = True  # This takes a while, set to False for debugging
+        max_grad_norm = 1  # Prevents bad batches from messing up the weights
         steps = 19073  # 10B / 2**19
         warmup_steps = 715  # 375 million tokens
-        total_batch_size = 2**21
-        max_step_size = 6e-4 * math.sqrt(total_batch_size / (2**19))
+        total_batch_size = 2**21  # Increased by 4x from GPT-2 for efficiency
+        max_step_size = 6e-4 * math.sqrt(total_batch_size / (2**19))  # Step size must increase as well
 
         local = sys.argv[1].lower()
         if local == "true":
@@ -173,7 +172,7 @@ def main(rank: int, world_size: int):
         if local:
             batch_size = 4
             block_size = 64
-            total_batch_size = 2**15
+            total_batch_size = 2**13
             compile_pytorch = False
             dataset_name = "small_shard"
 
@@ -217,7 +216,6 @@ def init_process(rank: int, size: int, fn: Callable, backend="gloo"):
 
 if __name__ == "__main__":
     num_processes = torch.cuda.device_count()
-    # num_processes = 2
     processes = []
     mp.set_start_method("spawn")
 

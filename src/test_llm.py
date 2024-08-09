@@ -1,6 +1,7 @@
+import dataclasses
 import pickle
 from pathlib import Path
-from typing import List
+from typing import List, Any
 
 import torch
 
@@ -9,6 +10,26 @@ from src.gpt2_weights import GPT2Weights
 from src.neural_net import GPT2Model, TransformerBlock
 from src.tokenization import GPT2Tokenizer
 from src.torch_settings import get_device, ConditionalAutocast
+
+
+def compare_dataclasses(dc1: Any, dc2: Any) -> bool:
+    if dataclasses.is_dataclass(dc1) and dataclasses.is_dataclass(dc2):
+        if type(dc1) != type(dc2):
+            return False
+        for field in dataclasses.fields(dc1):
+            value1 = getattr(dc1, field.name)
+            value2 = getattr(dc2, field.name)
+            if not compare_dataclasses(value1, value2):
+                return False
+        return True
+    elif isinstance(dc1, List) and isinstance(dc2, List):
+        if len(dc1) != len(dc2):
+            return False
+        for i in range(len(dc1)):
+            if not compare_dataclasses(dc1[i], dc2[i]):
+                return False
+        return True
+    return torch.equal(dc1, dc2)
 
 
 def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[int]):
@@ -79,6 +100,15 @@ def test_forward_backward(gpt2_tokenizer: GPT2Tokenizer, encoded_dataset: List[i
     assert torch.isclose(loss, torch.tensor(0.007), atol=3e-3)
     print(f"Successfully optimized batch to 0. Initial losses {loss1.item():0.2f} {loss2.item():0.2f}")
 
+    weights: GPT2Weights = llm.extract_weights()
+    p = Path("data/test_weights.pkl")
+    if p.exists():
+        p.unlink()
+    pickle.dump(weights, open(p, "wb"))
+    loaded_weights: GPT2Weights = pickle.load(open(p, "rb"))
+    assert compare_dataclasses(weights, loaded_weights)
+    p.unlink()
+
 
 def main():
     with torch.no_grad():
@@ -101,7 +131,7 @@ def main():
             )
             assert decoded == text
 
-        compile_pytorch = True
+        compile_pytorch = False
         autocast = False
 
         with ConditionalAutocast(autocast):

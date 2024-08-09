@@ -1,8 +1,8 @@
 ## NNpractice
 
-GPT2/3 training and inference code, written using pytorch,
+GPT2/3 LLM training and inference code, written using pytorch,
 based on Andrej Karpathy's nano-GPT videos.
-Only for educational purposes.
+Useful for educational purposes, and for experimenting with neural network architectures or interpretability.
 
 Forward and backward passes implemented for the following:
 - Linear 
@@ -55,6 +55,13 @@ To train the model:
 ```bash
 python -m src.gpt False
 ```
+
+To ensure the model is equivalent GPT-2/nanoGPT:
+```bash
+python -m src.test_llm
+```
+
+
 
 
 

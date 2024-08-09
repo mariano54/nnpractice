@@ -285,9 +285,17 @@ class GPT2Model:
             param *= scaling_factor
 
     def synchronize_gradients(self, dist_group, world_size: int):
-        for i, param in enumerate(self.gradients()):
-            dist.all_reduce(param, op=dist.ReduceOp.SUM, group=dist_group)
-            param /= world_size
+        combine_params = torch.concat([i.flatten() for i in self.gradients()])
+        dist.all_reduce(combine_params, op=dist.ReduceOp.SUM, group=dist_group)
+
+        total_processed = 0
+        for param in self.gradients():
+            param.data = (
+                combine_params[total_processed : total_processed + param.numel()].reshape(param.shape)
+                / world_size
+            )
+            total_processed += param.numel()
+        assert total_processed == combine_params.numel()
 
     def extract_weights(self):
         # Extract embeddings
