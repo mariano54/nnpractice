@@ -296,6 +296,7 @@ class GPT2Model:
             )
             total_processed += param.numel()
         assert total_processed == combine_params.numel()
+        del combine_params
 
     def extract_weights(self):
         # Extract embeddings

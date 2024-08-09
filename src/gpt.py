@@ -1,8 +1,10 @@
 import math
 import os
+import pickle
 import signal
 import sys
 import time
+from pathlib import Path
 from typing import Callable
 
 import torch
@@ -16,6 +18,7 @@ from src.data_loading import (
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from src.gpt2_weights import GPT2Weights
 from src.tokenization import GPT2Tokenizer
 from src.torch_settings import ConditionalAutocast, get_device
 from src.neural_net import GPT2Model, TransformerBlock
@@ -42,7 +45,7 @@ def get_cosine_step_size(step_index: int, max_steps: int, max_step_size: float, 
 
 def calculate_loss(llm: GPT2Model, dataset: torch.tensor) -> float:
     losses = []
-    for i in range(200):
+    for i in range(100):
         xs, ys = get_batch(dataset, llm.max_T, llm.max_B)
         probs, loss = llm.forward(xs, ys)
         losses.append(loss * probs.shape[0] / llm.max_B)  # Normalize for the final batch (maybe smaller)
@@ -60,6 +63,7 @@ def train(
     steps: int,
     warmup_steps: int,
     total_batch_size: int,
+    validation_freq: int,
 ):
     gpt2_tokenizer = GPT2Tokenizer()
     train_paths = get_filepaths(dataset_name, "train")
@@ -77,6 +81,7 @@ def train(
     assert total_batch_size % llm.max_B == 0
     num_mini_batches = int(total_batch_size / (llm.max_B * llm.max_T * world_size))
     dist_group = dist.new_group(list(range(world_size)))
+    min_validation_loss = 99999
 
     print(
         f"Starting training run on {get_device()}, steps: {steps} w{warmup_steps}, max_ss: {max_step_size} max grad: {max_grad_norm} B: {llm.max_B} T: {llm.max_T} large batch {total_batch_size}"
@@ -117,20 +122,32 @@ def train(
                 f"Loss at {step_i}= {round(total_loss.item(), 4)}, dt={to_ms(time.time() - start_t)}  TPS: {tokens_ps} "
                 f" {mem_after}, Norm: {norm:.2f} scaling {scaling_factor:.2f}, batches{num_mini_batches} lr {curr_step_size:.5f}"
             )
-            if step_i != 0 and step_i % 10 == 0:
+            if step_i != 0 and step_i % validation_freq == 0:
                 train_loss = calculate_loss(llm, data_loader.curr_file)
                 validation_loss = calculate_loss(llm, val_data_loader.curr_file)
                 print(f"Training loss: {train_loss:05f}, Validation loss: {validation_loss:05f}")
-                for i in range(15):
-                    gen = llm.generate(
-                        torch.tensor([gpt2_tokenizer.encode("Hi, I am a language model and")]).to(
-                            get_device()
-                        ),
-                        15,
-                        200,
-                        0.8,
-                    )
-                    print("\t", gpt2_tokenizer.decode(gen[0].tolist()))
+                if validation_loss < min_validation_loss:
+                    weights: GPT2Weights = llm.extract_weights()
+                    if step_i % (2 * validation_freq) == 0:
+                        path = Path(f"weights/trained_weights_0.pkl")
+                    else:
+                        path = Path(f"weights/trained_weights_1.pkl")
+                    print(f"Writing to disk to {path}")
+                    if path.exists():
+                        path.unlink()
+                    pickle.dump(weights, open(path, "wb"))
+                    print(f"Wrote to disk.")
+                xs = torch.tensor(
+                    [gpt2_tokenizer.encode("Hi, I am a language model and") for _ in range(8)]
+                ).to(get_device())
+                gen = llm.generate(
+                    xs,
+                    10,
+                    200,
+                    0.8,
+                )
+                for i in range(gen.shape[0]):
+                    print("\t", gpt2_tokenizer.decode(gen[i].tolist()))
     print(f"Training time: {time.time() - start_t0}")
 
 
@@ -140,14 +157,21 @@ def main(rank: int, world_size: int):
         neural_net.device = f"cuda:{rank}"
     print(f"Running main, rank {rank}, world size {world_size} on device: {get_device()}")
 
-    # Below configuration taken from https://github.com/karpathy/nanoGPT
+    # Below configuration taken from https://github.com/karpathy/nanoGPT and the GPT2 paper
     with torch.no_grad():
         seed = 1337
         torch.manual_seed(seed)
         torch.cuda.manual_seed(seed)
         torch.set_printoptions(precision=4)
-        batch_size = 16  # Can increase this up to 64 or higher if it fits in GPU
+        batch_size = 8  # Can increase this up to 64 or higher if it fits in GPU
         block_size = 1024
+        weights_filename = "weights/trained_weights_1.pkl"
+
+        if weights_filename is not None:
+            path = Path(weights_filename)
+            weights: GPT2Weights = pickle.load(open(path, "rb")).to(get_device())
+        else:
+            weights = None
 
         emb_dimension = 768
         vocab_size = 50304  # 50257, increased to 50304 since it's a nicer number
@@ -158,10 +182,13 @@ def main(rank: int, world_size: int):
         dataset_name = "sample-10BT"  # Fineweb dataset
         compile_pytorch = True  # This takes a while, set to False for debugging
         max_grad_norm = 1  # Prevents bad batches from messing up the weights
-        steps = 19073  # 10B / 2**19
-        warmup_steps = 715  # 375 million tokens
         total_batch_size = 2**21  # Increased by 4x from GPT-2 for efficiency
+        warmup_steps = int(715 / (total_batch_size / (2**19)))  # 375 million tokens
+        steps = int(19073 / (total_batch_size / (2**19)))  # 10B / 2**19
         max_step_size = 6e-4 * math.sqrt(total_batch_size / (2**19))  # Step size must increase as well
+        validation_freq = (
+            100  # Steps, log the validation/train loss, write the weights, and generate a bit
+        )
 
         local = sys.argv[1].lower()
         if local == "true":
@@ -170,7 +197,7 @@ def main(rank: int, world_size: int):
             local = False
 
         if local:
-            batch_size = 4
+            batch_size = 8
             block_size = 64
             total_batch_size = 2**13
             compile_pytorch = False
@@ -182,7 +209,7 @@ def main(rank: int, world_size: int):
                 TransformerBlock.backward = torch.compile(TransformerBlock.backward)
 
             llm = GPT2Model(
-                None,
+                weights,
                 batch_size,
                 block_size,
                 emb_dimension,
@@ -202,6 +229,7 @@ def main(rank: int, world_size: int):
                 steps,
                 warmup_steps,
                 total_batch_size,
+                validation_freq,
             )
 
 
